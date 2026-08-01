@@ -22,9 +22,10 @@ struct MarkdownStudioApp: App {
             CommandGroup(after: .saveItem) {
                 Button("另存为…") { document.saveAs() }
                     .keyboardShortcut("s", modifiers: [.command, .shift])
-                Divider()
+            }
+            CommandGroup(replacing: .printItem) {
                 Button("导出为 PDF…") { document.exportPDF() }
-                    .keyboardShortcut("e", modifiers: [.command, .shift])
+                    .keyboardShortcut("p", modifiers: .command)
             }
         }
     }
@@ -100,14 +101,21 @@ final class MarkdownDocument: ObservableObject {
     }
 
     func exportPDF() {
+        let optionsView = PDFExportOptionsView()
+        let optionsAlert = NSAlert()
+        optionsAlert.messageText = "PDF 导出设置"
+        optionsAlert.informativeText = "选择导出风格和正文字号，然后选择保存位置。"
+        optionsAlert.accessoryView = optionsView
+        optionsAlert.addButton(withTitle: "继续")
+        optionsAlert.addButton(withTitle: "取消")
+        guard optionsAlert.runModal() == .alertFirstButtonReturn else { return }
+
         let panel = NSSavePanel()
         panel.title = "导出 PDF"
         panel.nameFieldStringValue = (fileURL?.deletingPathExtension().lastPathComponent ?? "Markdown 文档") + ".pdf"
         panel.allowedContentTypes = [.pdf]
         panel.canCreateDirectories = true
         panel.directoryURL = fileURL?.deletingLastPathComponent() ?? FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
-        let optionsView = PDFExportOptionsView()
-        panel.accessoryView = optionsView
         guard panel.runModal() == .OK, let destination = panel.url else { return }
 
         let html = MarkdownRenderer.documentHTML(markdown: text, title: displayName, appearance: optionsView.options.appearance)
@@ -443,23 +451,28 @@ enum PDFExporter {
 }
 
 enum MarkdownRenderer {
-    private static let markedScript: String = {
+    private static let resourceBundle: Bundle = {
         let appResourceBundle = Bundle.main.resourceURL
             .flatMap { Bundle(url: $0.appendingPathComponent("MarkdownStudio_MarkdownStudio.bundle")) }
-        let resourceBundle = appResourceBundle ?? Bundle.module
-        guard let url = resourceBundle.url(forResource: "marked.min", withExtension: "js"),
-              let script = try? String(contentsOf: url, encoding: .utf8) else {
-            return ""
-        }
-        return script
+        return appResourceBundle ?? Bundle.module
     }()
+
+    private static func resourceText(_ name: String, _ fileExtension: String) -> String {
+        guard let url = resourceBundle.url(forResource: name, withExtension: fileExtension),
+              let text = try? String(contentsOf: url, encoding: .utf8) else { return "" }
+        return text
+    }
+
+    private static let markedScript = resourceText("marked.min", "js")
+    private static let katexScript = resourceText("katex.min", "js")
+    private static let katexCSS = resourceText("katex.min", "css")
 
     static func documentHTML(markdown: String, title: String, appearance: MarkdownAppearance = .preview) -> String {
         """
         <!doctype html><html><head><meta charset="utf-8"><title>\(escapeHTML(title))</title>
         <style>
-        :root { color-scheme: light dark; } body { margin: 0 auto; max-width: 880px; padding: 38px 48px; font: \(Int(appearance.fontSize))px -apple-system, BlinkMacSystemFont, 'PingFang SC', sans-serif; line-height: 1.72; color: #202124; background: #fff; } h1,h2,h3,h4,h5,h6 { line-height: 1.25; margin-top: 1.55em; } h1 { font-size: 2em; border-bottom: 1px solid #ddd; padding-bottom: .35em; } h2 { font-size: 1.5em; border-bottom: 1px solid #e5e5e5; padding-bottom: .25em; } code { background: #f2f4f7; padding: .15em .35em; border-radius: 4px; font: .9em ui-monospace, SFMono-Regular, Menlo, monospace; } pre { background: #f5f7f9; padding: 16px; border-radius: 8px; overflow:auto; } pre code { padding:0; background:none; } blockquote { border-left: 4px solid #9ba6b2; color: #5b6570; margin: 1em 0; padding: .1em 1em; } table { border-collapse: collapse; width:100%; } th,td { border:1px solid #d9dde3; padding: 7px 10px; text-align:left; } th { background:#f5f7f9; } img { max-width:100%; } a { color:#1967d2; } hr { border:0; border-top:1px solid #ddd; margin: 2em 0; } input[type=checkbox] { margin-right: .45em; } kbd { border: 1px solid #b8bec7; border-bottom-width: 2px; border-radius: 4px; background: #f5f5f5; padding: .05em .35em; font: .85em ui-monospace, monospace; } details { border: 1px solid #d9dde3; border-radius: 7px; padding: .45em .8em; } summary { cursor: pointer; font-weight: 600; } \(appearance.additionalCSS) @media print { body { padding: 20px; max-width: none; } }
-        </style></head><body><main id="content"></main><script>\(markedScript)</script>
+        :root { color-scheme: light dark; } body { margin: 0 auto; max-width: 880px; padding: 38px 48px; font: \(Int(appearance.fontSize))px -apple-system, BlinkMacSystemFont, 'PingFang SC', sans-serif; line-height: 1.72; color: #202124; background: #fff; } h1,h2,h3,h4,h5,h6 { line-height: 1.25; margin-top: 1.55em; } h1 { font-size: 2em; border-bottom: 1px solid #ddd; padding-bottom: .35em; } h2 { font-size: 1.5em; border-bottom: 1px solid #e5e5e5; padding-bottom: .25em; } code { background: #f2f4f7; padding: .15em .35em; border-radius: 4px; font: .9em ui-monospace, SFMono-Regular, Menlo, monospace; } pre { background: #f5f7f9; padding: 16px; border-radius: 8px; overflow:auto; } pre code { padding:0; background:none; } blockquote { border-left: 4px solid #9ba6b2; color: #5b6570; margin: 1em 0; padding: .1em 1em; } table { border-collapse: collapse; width:100%; } th,td { border:1px solid #d9dde3; padding: 7px 10px; text-align:left; } th { background:#f5f7f9; } img { max-width:100%; } a { color:#1967d2; } hr { border:0; border-top:1px solid #ddd; margin: 2em 0; } input[type=checkbox] { margin-right: .45em; } kbd { border: 1px solid #b8bec7; border-bottom-width: 2px; border-radius: 4px; background: #f5f5f5; padding: .05em .35em; font: .85em ui-monospace, monospace; } details { border: 1px solid #d9dde3; border-radius: 7px; padding: .45em .8em; } summary { cursor: pointer; font-weight: 600; } \(katexCSS) \(appearance.additionalCSS) @media print { body { padding: 20px; max-width: none; } }
+        </style></head><body><main id="content"></main><script>\(markedScript)</script><script>\(katexScript)</script>
         <script>
         const source = \(scriptString(markdown));
         const rawHTML = marked.parse(source, { gfm: true, breaks: false });
@@ -476,6 +489,29 @@ enum MarkdownRenderer {
           });
         });
         document.getElementById('content').innerHTML = safe.body.innerHTML;
+        const content = document.getElementById('content');
+        const textNodes = [];
+        const walker = document.createTreeWalker(content, NodeFilter.SHOW_TEXT, {
+          acceptNode(node) { return node.parentElement && !node.parentElement.closest('code, pre, kbd, script, style') ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT; }
+        });
+        while (walker.nextNode()) textNodes.push(walker.currentNode);
+        const mathPattern = /(^|[^\\\\])(?:\\$\\$([\\s\\S]+?)\\$\\$|\\$([^$\\n]+?)\\$)/g;
+        textNodes.forEach(node => {
+          const text = node.nodeValue;
+          let match, lastIndex = 0, changed = false;
+          const fragment = document.createDocumentFragment();
+          while ((match = mathPattern.exec(text)) !== null) {
+            changed = true;
+            const prefixEnd = match.index + match[1].length;
+            fragment.append(document.createTextNode(text.slice(lastIndex, prefixEnd)));
+            const expression = (match[2] ?? match[3]).trim();
+            const wrapper = document.createElement(match[2] ? 'div' : 'span');
+            wrapper.innerHTML = katex.renderToString(expression, { throwOnError: false, displayMode: Boolean(match[2]) });
+            fragment.append(wrapper);
+            lastIndex = match.index + match[0].length;
+          }
+          if (changed) { fragment.append(document.createTextNode(text.slice(lastIndex))); node.replaceWith(fragment); }
+        });
         </script></body></html>
         """
     }
@@ -497,7 +533,7 @@ enum MarkdownExamples {
     static let defaultDocument = #"""
 # Markdown Studio · Markdown 语法示例
 
-这是应用启动时的示例文档。左侧可以直接修改，右侧使用 **GFM / CommonMark** 实时预览；按 `⇧⌘E` 可以导出为 PDF。
+这是应用启动时的示例文档。左侧可以直接修改，右侧使用 **GFM / CommonMark** 实时预览；按 `⌘P` 可以导出为 PDF。
 
 > 本地预览会安全地过滤脚本、嵌入网页和表单等危险 HTML；普通排版 HTML（如 `details` 和 `kbd`）可使用。
 
@@ -633,9 +669,9 @@ echo "这是嵌套的代码围栏"
 
 ---
 
-## 9. 常见扩展：可写入，但尚未在本应用启用
+## 9. 常见扩展
 
-这些并非 CommonMark/GFM 的全部标准能力，通常需要额外解析器或运行时；当前会作为普通 Markdown 文本处理。
+其中数学公式已内置离线渲染；其余项目通常需要额外解析器或运行时，目前会作为普通 Markdown 文本处理。
 
 ### 脚注（扩展）
 
@@ -643,9 +679,9 @@ echo "这是嵌套的代码围栏"
 
 [^1]: 需要脚注扩展。
 
-### 数学公式（KaTeX / MathJax 扩展）
+### 数学公式（已支持 KaTeX）
 
-行内：$E = mc^2$。
+行内：$E = mc^2$、$\frac{a}{b}$、$\sqrt{x^2 + y^2}$。
 
 块级：
 
@@ -675,6 +711,6 @@ tags: [markdown, notes]
 - GitHub Alerts，例如 `> [!NOTE]`
 - 公式编号、图表、流程图、引用文献
 
-这些都可以继续加入应用；每一项都需要明确的渲染规则或额外离线组件。
+脚注、Mermaid、YAML Front Matter、目录、Wiki 链接和 GitHub Alerts 都可以继续加入；每一项都需要明确的渲染规则或额外离线组件。
 """#
 }

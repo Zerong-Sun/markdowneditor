@@ -11,7 +11,11 @@ let package = Package(
         .executableTarget(
             name: "MarkdownStudio",
             path: "Sources",
-            resources: [.copy("Resources/marked.min.js")]
+            resources: [
+                .copy("Resources/marked.min.js"),
+                .copy("Resources/katex.min.js"),
+                .copy("Resources/katex.min.css")
+            ]
         )
     ]
 )
