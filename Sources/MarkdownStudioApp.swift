@@ -209,6 +209,7 @@ final class PDFExportOptionsView: NSView {
 struct ContentView: View {
     @EnvironmentObject private var document: MarkdownDocument
     @State private var showingPreview = true
+    @State private var renderEditing = false
     @State private var editorScrollProgress = 0.0
 
     var body: some View {
@@ -222,6 +223,9 @@ struct ContentView: View {
                 Spacer()
                 Toggle(isOn: $showingPreview) { Label("预览", systemImage: "eye") }
                     .toggleStyle(.button)
+                Toggle(isOn: $renderEditing) { Label("渲染编辑", systemImage: "pencil.and.outline") }
+                    .toggleStyle(.button)
+                    .disabled(!showingPreview)
                 Button(action: document.exportPDF) { Label("导出 PDF", systemImage: "doc.richtext") }
             }
             .padding(12)
@@ -239,12 +243,22 @@ struct ContentView: View {
 
                 if showingPreview {
                     VStack(alignment: .leading, spacing: 0) {
-                        panelHeader("实时预览", icon: "doc.text.image")
-                        MarkdownPreview(
-                            markdown: document.text,
-                            baseURL: document.fileURL?.deletingLastPathComponent(),
-                            scrollProgress: editorScrollProgress
-                        )
+                        panelHeader(renderEditing ? "渲染编辑 — 直接在右侧修改" : "实时预览", icon: renderEditing ? "pencil.and.outline" : "doc.text.image")
+                        if renderEditing {
+                            RenderedMarkdownEditor(
+                                markdown: Binding(
+                                    get: { document.text },
+                                    set: { document.text = $0; document.isDirty = true }
+                                ),
+                                baseURL: document.fileURL?.deletingLastPathComponent()
+                            )
+                        } else {
+                            MarkdownPreview(
+                                markdown: document.text,
+                                baseURL: document.fileURL?.deletingLastPathComponent(),
+                                scrollProgress: editorScrollProgress
+                            )
+                        }
                     }
                     .frame(minWidth: 380)
                 }
@@ -401,6 +415,54 @@ struct MarkdownPreview: NSViewRepresentable {
     }
 }
 
+struct RenderedMarkdownEditor: NSViewRepresentable {
+    @Binding var markdown: String
+    let baseURL: URL?
+
+    func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
+
+    func makeNSView(context: Context) -> WKWebView {
+        let configuration = WKWebViewConfiguration()
+        configuration.userContentController.add(context.coordinator, name: "markdownChanged")
+        let view = WKWebView(frame: .zero, configuration: configuration)
+        view.setValue(false, forKey: "drawsBackground")
+        view.navigationDelegate = context.coordinator
+        return view
+    }
+
+    func updateNSView(_ view: WKWebView, context: Context) {
+        context.coordinator.parent = self
+        let basePath = baseURL?.path
+        if context.coordinator.acceptingRenderedEdit {
+            context.coordinator.acceptingRenderedEdit = false
+            context.coordinator.lastMarkdown = markdown
+            context.coordinator.lastBasePath = basePath
+            return
+        }
+        guard context.coordinator.lastMarkdown != markdown || context.coordinator.lastBasePath != basePath else { return }
+        context.coordinator.lastMarkdown = markdown
+        context.coordinator.lastBasePath = basePath
+        view.loadHTMLString(MarkdownRenderer.documentHTML(markdown: markdown, title: "渲染编辑", editable: true), baseURL: baseURL)
+    }
+
+    @MainActor
+    final class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
+        var parent: RenderedMarkdownEditor
+        var lastMarkdown = ""
+        var lastBasePath: String?
+        var acceptingRenderedEdit = false
+
+        init(parent: RenderedMarkdownEditor) { self.parent = parent }
+
+        func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+            guard message.name == "markdownChanged", let value = message.body as? String else { return }
+            acceptingRenderedEdit = true
+            lastMarkdown = value
+            parent.markdown = value
+        }
+    }
+}
+
 enum PDFExporter {
     @MainActor
     static func export(webView: WKWebView, html: String, baseURL: URL?, to url: URL, completion: @escaping @MainActor (Result<Void, Error>) -> Void) {
@@ -470,7 +532,7 @@ enum MarkdownRenderer {
         return resourceText("katex.min", "css").replacingOccurrences(of: "url(fonts/", with: "url(\(fontsURL)")
     }()
 
-    static func documentHTML(markdown: String, title: String, appearance: MarkdownAppearance = .preview) -> String {
+    static func documentHTML(markdown: String, title: String, appearance: MarkdownAppearance = .preview, editable: Bool = false) -> String {
         """
         <!doctype html><html><head><meta charset="utf-8"><title>\(escapeHTML(title))</title>
         <style>
@@ -478,6 +540,7 @@ enum MarkdownRenderer {
         </style></head><body><main id="content"></main><script>\(markedScript)</script><script>\(katexScript)</script>
         <script>
         const source = \(scriptString(markdown));
+        const renderEditing = \(editable ? "true" : "false");
         const rawHTML = marked.parse(source, { gfm: true, breaks: false });
         const safe = new DOMParser().parseFromString(rawHTML, 'text/html');
         safe.querySelectorAll('script, style, iframe, frame, frameset, object, embed, form, button, textarea, select, option, link, meta, base, svg, math').forEach(node => node.remove());
@@ -509,12 +572,73 @@ enum MarkdownRenderer {
             fragment.append(document.createTextNode(text.slice(lastIndex, prefixEnd)));
             const expression = (match[2] ?? match[3]).trim();
             const wrapper = document.createElement(match[2] ? 'div' : 'span');
+            wrapper.dataset.markdownMath = expression;
+            wrapper.dataset.displayMath = Boolean(match[2]).toString();
             wrapper.innerHTML = katex.renderToString(expression, { throwOnError: false, displayMode: Boolean(match[2]) });
             fragment.append(wrapper);
             lastIndex = match.index + match[0].length;
           }
           if (changed) { fragment.append(document.createTextNode(text.slice(lastIndex))); node.replaceWith(fragment); }
         });
+        function inlineMarkdown(node) {
+          if (node.nodeType === Node.TEXT_NODE) return node.nodeValue;
+          if (node.nodeType !== Node.ELEMENT_NODE) return '';
+          if (node.dataset && node.dataset.markdownMath) return node.dataset.displayMath === 'true' ? `$$\\n${node.dataset.markdownMath}\\n$$` : `$${node.dataset.markdownMath}$`;
+          const value = Array.from(node.childNodes).map(inlineMarkdown).join('');
+          switch (node.tagName) {
+            case 'STRONG': case 'B': return `**${value}**`;
+            case 'EM': case 'I': return `*${value}*`;
+            case 'DEL': case 'S': return `~~${value}~~`;
+            case 'CODE': return `\\`${node.textContent.replace(/`/g, '\\\\`')}\\``;
+            case 'A': return `[${value}](${node.getAttribute('href') || ''})`;
+            case 'IMG': return `![${node.getAttribute('alt') || ''}](${node.getAttribute('src') || ''})`;
+            case 'BR': return '  \\n';
+            case 'INPUT': return node.checked ? '[x] ' : '[ ] ';
+            default: return value;
+          }
+        }
+        function listMarkdown(list, depth = 0) {
+          return Array.from(list.children).filter(node => node.tagName === 'LI').map((item, index) => {
+            const prefix = list.tagName === 'OL' ? `${index + 1}. ` : '- ';
+            const own = Array.from(item.childNodes).filter(node => !['UL', 'OL'].includes(node.tagName)).map(inlineMarkdown).join('').trim();
+            const nested = Array.from(item.children).filter(node => ['UL', 'OL'].includes(node.tagName)).map(node => listMarkdown(node, depth + 1)).join('');
+            return `${'  '.repeat(depth)}${prefix}${own}\\n${nested}`;
+          }).join('');
+        }
+        function tableMarkdown(table) {
+          const rows = Array.from(table.querySelectorAll('tr'));
+          if (!rows.length) return '';
+          const row = element => Array.from(element.children).map(cell => inlineMarkdown(cell).replace(/\\|/g, '\\\\|').trim());
+          const header = row(rows[0]);
+          const divider = header.map((_, index) => {
+            const align = rows[0].children[index]?.style.textAlign;
+            return align === 'center' ? ':---:' : align === 'right' ? '---:' : ':---';
+          });
+          return [header, divider, ...rows.slice(1).map(row)].map(cells => `| ${cells.join(' | ')} |`).join('\\n');
+        }
+        function blockMarkdown(node) {
+          if (node.nodeType === Node.TEXT_NODE) return node.nodeValue.trim();
+          if (node.nodeType !== Node.ELEMENT_NODE) return '';
+          const children = () => Array.from(node.childNodes).map(blockMarkdown).filter(Boolean).join('\\n\\n');
+          const text = inlineMarkdown(node).trim();
+          if (/^H[1-6]$/.test(node.tagName)) return `${'#'.repeat(Number(node.tagName[1]))} ${text}`;
+          if (node.tagName === 'P') return text;
+          if (node.tagName === 'PRE') { const code = node.textContent.replace(/\\n$/, ''); const language = node.querySelector('code')?.className.match(/language-([^\\s]+)/)?.[1] || ''; return `\\`\\`\\`${language}\\n${code}\\n\\`\\`\\``; }
+          if (node.tagName === 'BLOCKQUOTE') return children().split('\\n').map(line => `> ${line}`).join('\\n');
+          if (node.tagName === 'UL' || node.tagName === 'OL') return listMarkdown(node).trim();
+          if (node.tagName === 'TABLE') return tableMarkdown(node);
+          if (node.tagName === 'HR') return '---';
+          if (node.tagName === 'IMG') return text;
+          return children() || text;
+        }
+        function renderedToMarkdown(root) { return Array.from(root.childNodes).map(blockMarkdown).filter(Boolean).join('\\n\\n').replace(/\\n{3,}/g, '\\n\\n').trim() + '\\n'; }
+        if (renderEditing) {
+          content.contentEditable = 'true';
+          content.spellcheck = true;
+          content.setAttribute('aria-label', '渲染编辑区');
+          content.querySelectorAll('[data-markdown-math]').forEach(node => { node.contentEditable = 'false'; });
+          content.addEventListener('input', () => window.webkit.messageHandlers.markdownChanged.postMessage(renderedToMarkdown(content)));
+        }
         </script></body></html>
         """
     }
