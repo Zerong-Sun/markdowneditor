@@ -1,0 +1,6 @@
+.DS_Store
+.build/
+Markdown Studio.app/
+*.xcuserstate
+dist/*.zip
+!dist/.gitkeep
