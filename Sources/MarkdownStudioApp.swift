@@ -137,14 +137,8 @@ final class MarkdownDocument: ObservableObject {
     }
 
     func exportPDF() {
-        let optionsView = PDFExportOptionsView()
-        let optionsAlert = NSAlert()
-        optionsAlert.messageText = "PDF 导出设置"
-        optionsAlert.informativeText = "选择导出风格和正文字号，然后选择保存位置。"
-        optionsAlert.accessoryView = optionsView
-        optionsAlert.addButton(withTitle: "继续")
-        optionsAlert.addButton(withTitle: "取消")
-        guard optionsAlert.runModal() == .alertFirstButtonReturn else { return }
+        let optionsPanel = PDFExportOptionsPanel()
+        guard optionsPanel.run() else { return }
 
         let panel = NSSavePanel()
         panel.title = "导出 PDF"
@@ -154,7 +148,7 @@ final class MarkdownDocument: ObservableObject {
         panel.directoryURL = fileURL?.deletingLastPathComponent() ?? FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
         guard panel.runModal() == .OK, let destination = panel.url else { return }
 
-        let html = MarkdownRenderer.documentHTML(markdown: text, title: displayName, appearance: optionsView.options.appearance)
+        let html = MarkdownRenderer.documentHTML(markdown: text, title: displayName, appearance: optionsPanel.options.appearance)
         let webView = WKWebView(frame: NSRect(x: 0, y: 0, width: 794, height: 1123))
         PDFExporter.export(webView: webView, html: html, baseURL: fileURL?.deletingLastPathComponent(), to: destination) { [weak self] result in
             DispatchQueue.main.async {
@@ -204,7 +198,7 @@ struct PDFExportOptions {
 }
 
 final class PDFExportOptionsView: NSView {
-    private let stylePopup = NSPopUpButton(frame: NSRect(x: 105, y: 52, width: 175, height: 26), pullsDown: false)
+    private let stylePopup = NSPopUpButton(frame: NSRect(x: 92, y: 52, width: 268, height: 26), pullsDown: false)
     private let fontSlider = NSSlider(value: 16, minValue: 11, maxValue: 26, target: nil, action: nil)
     private let fontValue = NSTextField(labelWithString: "16 pt")
 
@@ -212,25 +206,25 @@ final class PDFExportOptionsView: NSView {
         PDFExportOptions(style: PDFExportStyle.allCases[stylePopup.indexOfSelectedItem], fontSize: CGFloat(fontSlider.doubleValue))
     }
 
-    override init(frame frameRect: NSRect = NSRect(x: 0, y: 0, width: 292, height: 92)) {
+    override init(frame frameRect: NSRect = NSRect(x: 0, y: 0, width: 360, height: 84)) {
         super.init(frame: frameRect)
         let styleLabel = NSTextField(labelWithString: "导出风格")
-        styleLabel.frame = NSRect(x: 0, y: 56, width: 90, height: 20)
+        styleLabel.frame = NSRect(x: 0, y: 56, width: 82, height: 20)
         addSubview(styleLabel)
         stylePopup.addItems(withTitles: PDFExportStyle.allCases.map(\.name))
         stylePopup.selectItem(at: 0)
         addSubview(stylePopup)
 
         let sizeLabel = NSTextField(labelWithString: "正文字号")
-        sizeLabel.frame = NSRect(x: 0, y: 18, width: 90, height: 20)
+        sizeLabel.frame = NSRect(x: 0, y: 18, width: 82, height: 20)
         addSubview(sizeLabel)
-        fontSlider.frame = NSRect(x: 105, y: 18, width: 125, height: 20)
+        fontSlider.frame = NSRect(x: 92, y: 18, width: 210, height: 20)
         fontSlider.target = self
         fontSlider.action = #selector(fontSizeChanged)
         fontSlider.numberOfTickMarks = 16
         fontSlider.allowsTickMarkValuesOnly = true
         addSubview(fontSlider)
-        fontValue.frame = NSRect(x: 240, y: 18, width: 48, height: 20)
+        fontValue.frame = NSRect(x: 312, y: 18, width: 48, height: 20)
         fontValue.alignment = .right
         addSubview(fontValue)
     }
@@ -239,6 +233,66 @@ final class PDFExportOptionsView: NSView {
 
     @objc private func fontSizeChanged() {
         fontValue.stringValue = "\(Int(fontSlider.doubleValue)) pt"
+    }
+}
+
+final class PDFExportOptionsPanel: NSPanel, NSWindowDelegate {
+    private let optionsView = PDFExportOptionsView()
+
+    var options: PDFExportOptions { optionsView.options }
+
+    init() {
+        let contentSize = NSSize(width: 408, height: 178)
+        super.init(
+            contentRect: NSRect(origin: .zero, size: contentSize),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        title = "PDF 导出设置"
+        isReleasedWhenClosed = false
+        isMovableByWindowBackground = true
+        delegate = self
+        standardWindowButton(.zoomButton)?.isHidden = true
+        standardWindowButton(.miniaturizeButton)?.isHidden = true
+
+        let container = NSView(frame: NSRect(origin: .zero, size: contentSize))
+        contentView = container
+
+        let message = NSTextField(labelWithString: "选择导出风格和正文字号，然后选择保存位置。")
+        message.frame = NSRect(x: 24, y: 136, width: 360, height: 20)
+        container.addSubview(message)
+
+        optionsView.frame.origin = NSPoint(x: 24, y: 48)
+        container.addSubview(optionsView)
+
+        let cancel = NSButton(title: "取消", target: self, action: #selector(cancelPressed))
+        cancel.frame = NSRect(x: 208, y: 14, width: 84, height: 30)
+        cancel.keyEquivalent = "\u{1b}"
+        container.addSubview(cancel)
+
+        let proceed = NSButton(title: "继续", target: self, action: #selector(proceedPressed))
+        proceed.frame = NSRect(x: 300, y: 14, width: 84, height: 30)
+        proceed.keyEquivalent = "\r"
+        proceed.bezelStyle = .rounded
+        container.addSubview(proceed)
+        initialFirstResponder = optionsView
+    }
+
+    func run() -> Bool {
+        center()
+        makeKeyAndOrderFront(nil)
+        return NSApp.runModal(for: self) == .OK
+    }
+
+    @objc private func proceedPressed() { closeModal(with: .OK) }
+    @objc private func cancelPressed() { closeModal(with: .cancel) }
+
+    func windowWillClose(_ notification: Notification) { NSApp.stopModal(withCode: .cancel) }
+
+    private func closeModal(with response: NSApplication.ModalResponse) {
+        NSApp.stopModal(withCode: response)
+        orderOut(nil)
     }
 }
 
