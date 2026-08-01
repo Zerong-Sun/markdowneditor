@@ -5,12 +5,14 @@ import WebKit
 @main
 struct MarkdownStudioApp: App {
     @StateObject private var document = MarkdownDocument()
+    @NSApplicationDelegateAdaptor(MarkdownStudioAppDelegate.self) private var appDelegate
 
     var body: some Scene {
         WindowGroup("Markdown Studio") {
             ContentView()
                 .environmentObject(document)
                 .frame(minWidth: 900, minHeight: 600)
+                .onAppear { appDelegate.document = document }
         }
         .commands {
             CommandGroup(replacing: .newItem) {
@@ -32,6 +34,16 @@ struct MarkdownStudioApp: App {
 }
 
 @MainActor
+final class MarkdownStudioAppDelegate: NSObject, NSApplicationDelegate {
+    weak var document: MarkdownDocument?
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard let document, document.shouldDiscardChanges() else { return .terminateCancel }
+        return .terminateNow
+    }
+}
+
+@MainActor
 final class MarkdownDocument: ObservableObject {
     @Published var text: String = MarkdownExamples.defaultDocument
     @Published var fileURL: URL?
@@ -42,6 +54,10 @@ final class MarkdownDocument: ObservableObject {
     var displayName: String { fileURL?.lastPathComponent ?? "未命名文档" }
 
     func newDocument() {
+        confirmDiscardChanges { [weak self] in self?.createNewDocument() }
+    }
+
+    private func createNewDocument() {
         let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first!
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd_HHmmss"
@@ -59,6 +75,10 @@ final class MarkdownDocument: ObservableObject {
     }
 
     func openDocument() {
+        confirmDiscardChanges { [weak self] in self?.presentOpenPanel() }
+    }
+
+    private func presentOpenPanel() {
         let panel = NSOpenPanel()
         panel.title = "打开 Markdown 文件"
         panel.allowedContentTypes = [.plainText]
@@ -74,6 +94,22 @@ final class MarkdownDocument: ObservableObject {
                 errorMessage = "无法读取文件：\(error.localizedDescription)"
             }
         }
+    }
+
+    private func confirmDiscardChanges(_ action: @escaping () -> Void) {
+        guard shouldDiscardChanges() else { return }
+        action()
+    }
+
+    func shouldDiscardChanges() -> Bool {
+        guard isDirty else { return true }
+        let alert = NSAlert()
+        alert.messageText = "放弃未保存的更改？"
+        alert.informativeText = "当前文档中的未保存内容将丢失。"
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "放弃更改")
+        alert.addButton(withTitle: "取消")
+        return alert.runModal() == .alertFirstButtonReturn
     }
 
     func save() {
@@ -611,7 +647,8 @@ enum MarkdownRenderer {
           const row = element => Array.from(element.children).map(cell => inlineMarkdown(cell).replace(/\\|/g, '\\\\|').trim());
           const header = row(rows[0]);
           const divider = header.map((_, index) => {
-            const align = rows[0].children[index]?.style.textAlign;
+            const headerCell = rows[0].children[index];
+            const align = headerCell?.getAttribute('align') || headerCell?.style.textAlign;
             return align === 'center' ? ':---:' : align === 'right' ? '---:' : ':---';
           });
           return [header, divider, ...rows.slice(1).map(row)].map(cells => `| ${cells.join(' | ')} |`).join('\\n');
