@@ -251,7 +251,7 @@ final class PDFExportOptionsPanel: NSPanel, NSWindowDelegate {
         )
         title = "PDF 导出设置"
         isReleasedWhenClosed = false
-        isMovableByWindowBackground = true
+        isMovableByWindowBackground = false
         delegate = self
         standardWindowButton(.zoomButton)?.isHidden = true
         standardWindowButton(.miniaturizeButton)?.isHidden = true
