@@ -14,7 +14,8 @@ let package = Package(
             resources: [
                 .copy("Resources/marked.min.js"),
                 .copy("Resources/katex.min.js"),
-                .copy("Resources/katex.min.css")
+                .copy("Resources/katex.min.css"),
+                .copy("Resources/fonts")
             ]
         )
     ]

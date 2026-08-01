@@ -465,7 +465,10 @@ enum MarkdownRenderer {
 
     private static let markedScript = resourceText("marked.min", "js")
     private static let katexScript = resourceText("katex.min", "js")
-    private static let katexCSS = resourceText("katex.min", "css")
+    private static let katexCSS: String = {
+        let fontsURL = resourceBundle.resourceURL?.appendingPathComponent("fonts/", isDirectory: true).absoluteString ?? ""
+        return resourceText("katex.min", "css").replacingOccurrences(of: "url(fonts/", with: "url(\(fontsURL)")
+    }()
 
     static func documentHTML(markdown: String, title: String, appearance: MarkdownAppearance = .preview) -> String {
         """
