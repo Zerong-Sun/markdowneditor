@@ -2,11 +2,18 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-APP_PATH="$SCRIPT_DIR/Markdown Studio.app"
+# Keep the signed product outside iCloud-synced Documents folders, which can add
+# Finder metadata during codesigning. Override explicitly if a different output is needed.
+APP_PATH="${MARKDOWNSTUDIO_APP_PATH:-$HOME/Library/Caches/MarkdownStudio/Markdown Studio.app}"
+if [[ "$APP_PATH" != /*.app ]]; then
+  echo "MARKDOWNSTUDIO_APP_PATH must be an absolute .app path." >&2
+  exit 1
+fi
 
 cd "$SCRIPT_DIR"
-swift build -c release
-BUILD_DIR="$(swift build -c release --show-bin-path)"
+BUILD_CACHE="${MARKDOWNSTUDIO_BUILD_CACHE:-$HOME/Library/Caches/MarkdownStudio/build}"
+swift build -c release --scratch-path "$BUILD_CACHE"
+BUILD_DIR="$(swift build -c release --scratch-path "$BUILD_CACHE" --show-bin-path)"
 BUILD_PATH="$BUILD_DIR/MarkdownStudio"
 RESOURCE_BUNDLE="$BUILD_DIR/MarkdownStudio_MarkdownStudio.bundle"
 mkdir -p "$APP_PATH/Contents/MacOS" "$APP_PATH/Contents/Resources"
@@ -17,4 +24,5 @@ rm -rf "$APP_PATH/MarkdownStudio_MarkdownStudio.bundle"
 cp -R "$RESOURCE_BUNDLE" "$APP_PATH/Contents/Resources/"
 xattr -cr "$APP_PATH"
 codesign --force --deep --sign - "$APP_PATH" >/dev/null
+codesign --verify --deep --strict "$APP_PATH"
 echo "Built: $APP_PATH"

@@ -22,12 +22,20 @@ for (const requirement of [
   'keyboardShortcut("p", modifiers: .command)',
   'content.contentEditable = \'true\'',
   'markdownChanged',
-  'confirmDiscardChanges',
+  'shouldDiscardChanges',
   'applicationShouldTerminate',
+  'func application(_ application: NSApplication, open urls: [URL])',
+  'keyboardShortcut("s", modifiers: .command)',
+  'keyboardShortcut("w", modifiers: .command)',
+  'Window("Markdown Studio", id: "editor")',
+  'windowShouldClose',
+  'operation.canSpawnSeparateThread = true',
+  'operation.runModal(for: window',
+  'print-color-adjust: exact',
   'katex.renderToString'
 ]) expect(source.includes(requirement), `Missing source requirement: ${requirement}`);
 
-for (const requirement of ['CFBundleIconFile', 'AppIcon', 'CFBundleDocumentTypes']) {
+for (const requirement of ['CFBundleIconFile', 'AppIcon', 'CFBundleDocumentTypes', 'LSItemContentTypes', 'UTImportedTypeDeclarations', 'net.daringfireball.markdown']) {
   expect(info.includes(requirement), `Missing app metadata: ${requirement}`);
 }
 

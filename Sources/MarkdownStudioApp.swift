@@ -2,32 +2,47 @@ import AppKit
 import SwiftUI
 import WebKit
 
+#if !DOCUMENT_LIFECYCLE_TESTING
 @main
+#endif
 struct MarkdownStudioApp: App {
-    @StateObject private var document = MarkdownDocument()
+    @StateObject private var workspace = MarkdownWorkspace()
     @NSApplicationDelegateAdaptor(MarkdownStudioAppDelegate.self) private var appDelegate
 
     var body: some Scene {
-        WindowGroup("Markdown Studio") {
-            ContentView()
-                .environmentObject(document)
+        Window("Markdown Studio", id: "editor") {
+            MarkdownWorkspaceView()
+                .environmentObject(workspace)
                 .frame(minWidth: 900, minHeight: 600)
-                .onAppear { appDelegate.document = document }
+                .onAppear { appDelegate.attach(workspace) }
         }
         .commands {
             CommandGroup(replacing: .newItem) {
-                Button("新建 Markdown 文件") { document.newDocument() }
+                Button("新建 Markdown 文件") { workspace.newDocument() }
                     .keyboardShortcut("n", modifiers: .command)
-                Button("打开…") { document.openDocument() }
+                Button("打开…") { workspace.presentOpenPanel() }
                     .keyboardShortcut("o", modifiers: .command)
             }
-            CommandGroup(after: .saveItem) {
-                Button("另存为…") { document.saveAs() }
+            CommandGroup(replacing: .saveItem) {
+                Button("保存") { workspace.selectedDocument.save() }
+                    .keyboardShortcut("s", modifiers: .command)
+                Button("另存为…") { workspace.selectedDocument.saveAs() }
                     .keyboardShortcut("s", modifiers: [.command, .shift])
             }
+            CommandGroup(after: .saveItem) {
+                Button("关闭当前文档") {
+                    if workspace.documents.count > 1 {
+                        workspace.close(workspace.selectedDocument)
+                    } else {
+                        NSApp.mainWindow?.performClose(nil)
+                    }
+                }
+                .keyboardShortcut("w", modifiers: .command)
+            }
             CommandGroup(replacing: .printItem) {
-                Button("导出为 PDF…") { document.exportPDF() }
+                Button("导出为 PDF…") { workspace.selectedDocument.exportPDF() }
                     .keyboardShortcut("p", modifiers: .command)
+                    .disabled(workspace.selectedDocument.isExportingPDF)
             }
         }
     }
@@ -35,108 +50,244 @@ struct MarkdownStudioApp: App {
 
 @MainActor
 final class MarkdownStudioAppDelegate: NSObject, NSApplicationDelegate {
-    weak var document: MarkdownDocument?
+    private weak var workspace: MarkdownWorkspace?
+    private var pendingURLs: [URL] = []
+
+    func attach(_ workspace: MarkdownWorkspace) {
+        self.workspace = workspace
+        guard !pendingURLs.isEmpty else { return }
+        let urls = pendingURLs
+        pendingURLs.removeAll()
+        workspace.openDocuments(urls)
+    }
+
+    func application(_ application: NSApplication, open urls: [URL]) { open(urls) }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        let paths = CommandLine.arguments.dropFirst().filter {
+            !$0.hasPrefix("-") && (FileManager.default.fileExists(atPath: $0)
+                || MarkdownFileIO.markdownExtensions.contains(URL(fileURLWithPath: $0).pathExtension.lowercased())
+                || URL(fileURLWithPath: $0).pathExtension.lowercased() == "txt")
+        }
+        if !paths.isEmpty { open(paths.map { URL(fileURLWithPath: $0) }) }
+    }
+
+    func open(_ urls: [URL]) {
+        if let workspace {
+            workspace.openDocuments(urls)
+            workspace.showEditor?()
+        } else {
+            pendingURLs.append(contentsOf: urls)
+        }
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !flag { workspace?.showEditor?() }
+        return true
+    }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard let document, document.shouldDiscardChanges() else { return .terminateCancel }
+        if workspace?.windowCloseApproved == true { return .terminateNow }
+        guard workspace?.canCloseAllDocuments() ?? true else { return .terminateCancel }
         return .terminateNow
     }
 }
 
 @MainActor
+final class MarkdownWorkspace: ObservableObject {
+    @Published private(set) var documents: [MarkdownDocument]
+    @Published var selectedID: UUID
+    var showEditor: (() -> Void)?
+    var windowCloseApproved = false
+
+    init() {
+        let welcome = MarkdownDocument()
+        documents = [welcome]
+        selectedID = welcome.id
+    }
+
+    var selectedDocument: MarkdownDocument {
+        documents.first { $0.id == selectedID } ?? documents[0]
+    }
+
+    func newDocument() {
+        let document = MarkdownDocument()
+        guard document.createNewDocument() else {
+            selectedDocument.errorMessage = document.errorMessage
+            return
+        }
+        add(document)
+        showEditor?()
+    }
+
+    func presentOpenPanel() {
+        let panel = NSOpenPanel()
+        panel.title = "打开 Markdown 文件"
+        panel.allowedContentTypes = MarkdownFileIO.openableTypes
+        panel.allowsOtherFileTypes = true
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = false
+        panel.directoryURL = selectedDocument.fileURL?.deletingLastPathComponent()
+        if panel.runModal() == .OK { openDocuments(panel.urls) }
+    }
+
+    func openDocuments(_ urls: [URL]) {
+        var errors: [String] = []
+        for url in urls {
+            let normalizedURL = url.standardizedFileURL.resolvingSymlinksInPath()
+            if let existing = documents.first(where: { $0.fileURL?.standardizedFileURL.resolvingSymlinksInPath() == normalizedURL }) {
+                selectedID = existing.id
+                continue
+            }
+            let document = MarkdownDocument()
+            if document.load(normalizedURL) {
+                add(document)
+            } else {
+                errors.append("\(url.lastPathComponent)：\(document.errorMessage ?? "无法打开文件")")
+            }
+        }
+        if !errors.isEmpty { selectedDocument.errorMessage = errors.joined(separator: "\n") }
+    }
+
+    private func add(_ document: MarkdownDocument) {
+        // Replace only the untouched welcome tab. Never overwrite an edited document.
+        if documents.count == 1, documents[0].fileURL == nil, !documents[0].isDirty {
+            documents = [document]
+        } else {
+            documents.append(document)
+        }
+        selectedID = document.id
+    }
+
+    func close(_ document: MarkdownDocument) {
+        guard let index = documents.firstIndex(where: { $0.id == document.id }) else { return }
+        guard document.shouldDiscardChanges() else { return }
+        let remaining = documents.filter { $0.id != document.id }
+        documents = remaining.isEmpty ? [MarkdownDocument()] : remaining
+        if selectedID == document.id { selectedID = documents[min(index, documents.count - 1)].id }
+    }
+
+    func canCloseAllDocuments() -> Bool {
+        documents.allSatisfy { $0.shouldDiscardChanges() }
+    }
+}
+
+@MainActor
 final class MarkdownDocument: ObservableObject {
+    let id = UUID()
     @Published var text: String = MarkdownExamples.defaultDocument
     @Published var fileURL: URL?
     @Published var isDirty = false
     @Published var errorMessage: String?
     @Published var notice: String?
+    @Published var isExportingPDF = false
+    private var encoding: String.Encoding = .utf8
 
     var displayName: String { fileURL?.lastPathComponent ?? "未命名文档" }
 
-    func newDocument() {
-        confirmDiscardChanges { [weak self] in self?.createNewDocument() }
-    }
-
-    private func createNewDocument() {
-        let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first!
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyy-MM-dd_HHmmss"
-        let base = "note_\(formatter.string(from: Date()))"
-        var candidate = downloads.appendingPathComponent(base).appendingPathExtension("md")
-        var suffix = 2
-        while FileManager.default.fileExists(atPath: candidate.path) {
-            candidate = downloads.appendingPathComponent("\(base) \(suffix)").appendingPathExtension("md")
-            suffix += 1
-        }
-        text = "# 新文档\n\n"
-        fileURL = candidate
-        save()
-        notice = "已在下载目录创建：\(candidate.lastPathComponent)"
-    }
-
-    func openDocument() {
-        confirmDiscardChanges { [weak self] in self?.presentOpenPanel() }
-    }
-
-    private func presentOpenPanel() {
-        let panel = NSOpenPanel()
-        panel.title = "打开 Markdown 文件"
-        panel.allowedContentTypes = [.plainText]
-        panel.allowsMultipleSelection = false
-        panel.canChooseDirectories = false
-        if panel.runModal() == .OK, let url = panel.url {
-            do {
-                text = try String(contentsOf: url, encoding: .utf8)
-                fileURL = url
-                isDirty = false
-                notice = "已打开：\(url.lastPathComponent)"
-            } catch {
-                errorMessage = "无法读取文件：\(error.localizedDescription)"
+    @discardableResult
+    func createNewDocument() -> Bool {
+        do {
+            guard let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first else {
+                throw CocoaError(.fileNoSuchFile)
             }
+            let initialText = "# 新文档\n\n"
+            let destination = try MarkdownFileIO.createNote(in: downloads, text: initialText)
+            text = initialText
+            fileURL = destination
+            encoding = .utf8
+            errorMessage = nil
+            isDirty = false
+            notice = "已在下载目录创建：\(destination.lastPathComponent)"
+            return true
+        } catch {
+            errorMessage = "无法新建文件：\(error.localizedDescription)"
+            return false
         }
     }
 
-    private func confirmDiscardChanges(_ action: @escaping () -> Void) {
-        guard shouldDiscardChanges() else { return }
-        action()
+    @discardableResult
+    func load(_ url: URL) -> Bool {
+        do {
+            let loaded = try MarkdownFileIO.read(url)
+            text = loaded.text
+            encoding = loaded.encoding
+            fileURL = url
+            errorMessage = nil
+            isDirty = false
+            notice = "已打开：\(url.lastPathComponent)"
+            NSDocumentController.shared.noteNewRecentDocumentURL(url)
+            return true
+        } catch {
+            errorMessage = "无法读取文件：\(error.localizedDescription)"
+            return false
+        }
     }
 
     func shouldDiscardChanges() -> Bool {
         guard isDirty else { return true }
         let alert = NSAlert()
-        alert.messageText = "放弃未保存的更改？"
-        alert.informativeText = "当前文档中的未保存内容将丢失。"
+        alert.messageText = "保存“\(displayName)”的更改？"
+        alert.informativeText = "保存后再继续，或选择不保存。"
         alert.alertStyle = .warning
-        alert.addButton(withTitle: "放弃更改")
+        alert.addButton(withTitle: "保存")
         alert.addButton(withTitle: "取消")
-        return alert.runModal() == .alertFirstButtonReturn
-    }
-
-    func save() {
-        guard let url = fileURL else { saveAs(); return }
-        do {
-            try text.write(to: url, atomically: true, encoding: .utf8)
-            isDirty = false
-            notice = "已保存"
-        } catch {
-            errorMessage = "无法保存文件：\(error.localizedDescription)"
+        alert.addButton(withTitle: "不保存")
+        switch alert.runModal() {
+        case .alertFirstButtonReturn: return save()
+        case .alertThirdButtonReturn: return true
+        default: return false
         }
     }
 
-    func saveAs() {
+    @discardableResult
+    func save() -> Bool {
+        guard let url = fileURL else { return saveAs() }
+        do {
+            try MarkdownFileIO.write(text, to: url, encoding: encoding)
+            errorMessage = nil
+            isDirty = false
+            notice = "已保存"
+            return true
+        } catch {
+            errorMessage = "无法保存文件：\(error.localizedDescription)"
+            return false
+        }
+    }
+
+    @discardableResult
+    func saveAs() -> Bool {
         let panel = NSSavePanel()
         panel.title = "保存 Markdown 文件"
-        panel.nameFieldStringValue = fileURL?.lastPathComponent ?? "Untitled.md"
-        panel.allowedContentTypes = [.plainText]
+        panel.nameFieldStringValue = fileURL?.lastPathComponent ?? "note.md"
+        panel.allowedContentTypes = [MarkdownFileIO.markdownType]
+        panel.allowsOtherFileTypes = true
         panel.canCreateDirectories = true
         panel.directoryURL = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
         if panel.runModal() == .OK, let url = panel.url {
-            fileURL = url.pathExtension.isEmpty ? url.appendingPathExtension("md") : url
-            save()
+            let destination = url.pathExtension.isEmpty ? url.appendingPathExtension("md") : url
+            do {
+                try MarkdownFileIO.write(text, to: destination, encoding: encoding)
+                fileURL = destination
+                errorMessage = nil
+                isDirty = false
+                notice = "已保存：\(destination.lastPathComponent)"
+                NSDocumentController.shared.noteNewRecentDocumentURL(destination)
+                return true
+            } catch {
+                errorMessage = "无法另存为：\(error.localizedDescription)"
+            }
         }
+        return false
     }
 
     func exportPDF() {
+        guard !isExportingPDF else { return }
+        guard let exportWindow = NSApp.mainWindow ?? NSApp.windows.first(where: { $0.canBecomeMain && !($0 is NSPanel) }) else {
+            errorMessage = "请先打开文档窗口，再导出 PDF。"
+            return
+        }
         let optionsPanel = PDFExportOptionsPanel()
         guard optionsPanel.run() else { return }
 
@@ -150,11 +301,16 @@ final class MarkdownDocument: ObservableObject {
 
         let html = MarkdownRenderer.documentHTML(markdown: text, title: displayName, appearance: optionsPanel.options.appearance)
         let webView = WKWebView(frame: NSRect(x: 0, y: 0, width: 794, height: 1123))
-        PDFExporter.export(webView: webView, html: html, baseURL: fileURL?.deletingLastPathComponent(), to: destination) { [weak self] result in
+        isExportingPDF = true
+        notice = "正在导出 PDF…"
+        PDFExporter.export(webView: webView, window: exportWindow, html: html, baseURL: fileURL?.deletingLastPathComponent(), to: destination) { [weak self] result in
             DispatchQueue.main.async {
+                self?.isExportingPDF = false
                 switch result {
                 case .success: self?.notice = "已导出 PDF：\(destination.lastPathComponent)"
-                case .failure(let error): self?.errorMessage = "PDF 导出失败：\(error.localizedDescription)"
+                case .failure(let error):
+                    self?.notice = "PDF 导出未完成"
+                    self?.errorMessage = "PDF 导出失败：\(error.localizedDescription)"
                 }
             }
         }
@@ -194,7 +350,22 @@ struct PDFExportOptions {
     let style: PDFExportStyle
     let fontSize: CGFloat
 
-    var appearance: MarkdownAppearance { MarkdownAppearance(fontSize: fontSize, additionalCSS: style.css) }
+    var appearance: MarkdownAppearance {
+        let css = """
+        \(style.css)
+        body { font-size: \(Int(fontSize))pt; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+        @media print {
+          html { background: #fff; }
+          body { isolation: isolate; }
+          body::before { content: ''; position: fixed; inset: 0; z-index: -1; background: inherit; }
+          h1,h2,h3,h4,h5,h6 { break-after: avoid; }
+          tr, img { break-inside: avoid; }
+          pre { white-space: pre-wrap; overflow: visible; overflow-wrap: anywhere; }
+          td,th { overflow-wrap: anywhere; }
+        }
+        """
+        return MarkdownAppearance(fontSize: fontSize, additionalCSS: css)
+    }
 }
 
 final class PDFExportOptionsView: NSView {
@@ -296,7 +467,122 @@ final class PDFExportOptionsPanel: NSPanel, NSWindowDelegate {
     }
 }
 
+struct MarkdownWorkspaceView: View {
+    @EnvironmentObject private var workspace: MarkdownWorkspace
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if workspace.documents.count > 1 {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach(workspace.documents, id: \.id) { document in
+                            MarkdownDocumentTab(document: document)
+                        }
+                    }
+                    .padding(8)
+                }
+                .background(.bar)
+            }
+            ContentView()
+                .environmentObject(workspace.selectedDocument)
+                .id(workspace.selectedID)
+        }
+        .background(EditorWindowGuard(workspace: workspace))
+        .onAppear {
+            // A single editor window owns the tabs, including after the last window closes.
+            workspace.showEditor = { openWindow(id: "editor") }
+        }
+        .dropDestination(for: URL.self) { urls, _ in
+            guard !urls.isEmpty else { return false }
+            workspace.openDocuments(urls)
+            return true
+        }
+    }
+}
+
+/// Ask before closing the only window, rather than after SwiftUI has already closed it.
+struct EditorWindowGuard: NSViewRepresentable {
+    let workspace: MarkdownWorkspace
+
+    func makeCoordinator() -> Coordinator { Coordinator(workspace: workspace) }
+
+    func makeNSView(context: Context) -> WindowProbe {
+        let view = WindowProbe()
+        view.onWindow = { [weak coordinator = context.coordinator] in coordinator?.attach(to: $0) }
+        return view
+    }
+
+    func updateNSView(_ view: WindowProbe, context: Context) {
+        if let window = view.window { context.coordinator.attach(to: window) }
+    }
+
+    final class WindowProbe: NSView {
+        var onWindow: (@MainActor (NSWindow) -> Void)?
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            if let window { onWindow?(window) }
+        }
+    }
+
+    final class Coordinator: NSObject, NSWindowDelegate {
+        private let workspace: MarkdownWorkspace
+        private weak var originalDelegate: NSWindowDelegate?
+        private var prompting = false
+
+        init(workspace: MarkdownWorkspace) { self.workspace = workspace }
+
+        @MainActor func attach(to window: NSWindow) {
+            guard window.delegate !== self else { return }
+            originalDelegate = window.delegate
+            window.delegate = self
+        }
+
+        func windowShouldClose(_ sender: NSWindow) -> Bool {
+            guard !prompting else { return false }
+            prompting = true
+            defer { prompting = false }
+            guard workspace.canCloseAllDocuments(), originalDelegate?.windowShouldClose?(sender) ?? true else { return false }
+            // The Window scene terminates after closing; don't ask a second time.
+            workspace.windowCloseApproved = true
+            return true
+        }
+
+        override func responds(to selector: Selector!) -> Bool {
+            super.responds(to: selector) || originalDelegate?.responds(to: selector) == true
+        }
+
+        override func forwardingTarget(for selector: Selector!) -> Any? {
+            if originalDelegate?.responds(to: selector) == true { return originalDelegate }
+            return super.forwardingTarget(for: selector)
+        }
+    }
+}
+
+struct MarkdownDocumentTab: View {
+    @EnvironmentObject private var workspace: MarkdownWorkspace
+    @ObservedObject var document: MarkdownDocument
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Button(document.displayName + (document.isDirty ? " •" : "")) {
+                workspace.selectedID = document.id
+            }
+            .buttonStyle(.plain)
+            Button { workspace.close(document) } label: { Image(systemName: "xmark") }
+                .buttonStyle(.plain)
+                .help("关闭“\(document.displayName)”")
+                .accessibilityLabel("关闭“\(document.displayName)”")
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(workspace.selectedID == document.id ? Color.accentColor.opacity(0.16) : Color.clear)
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+    }
+}
+
 struct ContentView: View {
+    @EnvironmentObject private var workspace: MarkdownWorkspace
     @EnvironmentObject private var document: MarkdownDocument
     @State private var showingPreview = true
     @State private var renderEditing = false
@@ -305,11 +591,11 @@ struct ContentView: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 10) {
-                Button(action: document.newDocument) { Label("新建", systemImage: "square.and.pencil") }
-                Button(action: document.openDocument) { Label("打开", systemImage: "folder") }
-                Button(action: document.save) { Label("保存", systemImage: "square.and.arrow.down") }
+                Button(action: workspace.newDocument) { Label("新建", systemImage: "square.and.pencil") }
+                Button(action: workspace.presentOpenPanel) { Label("打开", systemImage: "folder") }
+                Button { document.save() } label: { Label("保存", systemImage: "square.and.arrow.down") }
                     .disabled(!document.isDirty && document.fileURL != nil)
-                Button(action: document.saveAs) { Label("另存为", systemImage: "arrow.down.doc") }
+                Button { document.saveAs() } label: { Label("另存为", systemImage: "arrow.down.doc") }
                 Spacer()
                 Toggle(isOn: $showingPreview) { Label("预览", systemImage: "eye") }
                     .toggleStyle(.button)
@@ -317,6 +603,7 @@ struct ContentView: View {
                     .toggleStyle(.button)
                     .disabled(!showingPreview)
                 Button(action: document.exportPDF) { Label("导出 PDF", systemImage: "doc.richtext") }
+                    .disabled(document.isExportingPDF)
             }
             .padding(12)
             .background(.bar)
@@ -327,7 +614,7 @@ struct ContentView: View {
                     SyncedMarkdownEditor(text: Binding(
                         get: { document.text },
                         set: { document.text = $0; document.isDirty = true }
-                    ), onScrollChange: { editorScrollProgress = $0 })
+                    ), onScrollChange: { editorScrollProgress = $0 }, onOpenFiles: workspace.openDocuments)
                 }
                 .frame(minWidth: 380)
 
@@ -340,13 +627,15 @@ struct ContentView: View {
                                     get: { document.text },
                                     set: { document.text = $0; document.isDirty = true }
                                 ),
-                                baseURL: document.fileURL?.deletingLastPathComponent()
+                                baseURL: document.fileURL?.deletingLastPathComponent(),
+                                onOpenFiles: workspace.openDocuments
                             )
                         } else {
                             MarkdownPreview(
                                 markdown: document.text,
                                 baseURL: document.fileURL?.deletingLastPathComponent(),
-                                scrollProgress: editorScrollProgress
+                                scrollProgress: editorScrollProgress,
+                                onOpenFiles: workspace.openDocuments
                             )
                         }
                     }
@@ -359,7 +648,7 @@ struct ContentView: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
                 Spacer()
-                Text(document.isDirty ? "未保存的更改" : "已保存")
+                Text(document.isDirty ? "未保存的更改" : (document.notice ?? "已保存"))
             }
             .font(.caption)
             .foregroundStyle(.secondary)
@@ -369,12 +658,12 @@ struct ContentView: View {
         }
         .navigationTitle(document.displayName + (document.isDirty ? " •" : ""))
         .alert("Markdown Studio", isPresented: Binding(
-            get: { document.errorMessage != nil || document.notice != nil },
-            set: { if !$0 { document.errorMessage = nil; document.notice = nil } }
+            get: { document.errorMessage != nil },
+            set: { if !$0 { document.errorMessage = nil } }
         )) {
-            Button("好") { document.errorMessage = nil; document.notice = nil }
+            Button("好") { document.errorMessage = nil }
         } message: {
-            Text(document.errorMessage ?? document.notice ?? "")
+            Text(document.errorMessage ?? "")
         }
     }
 
@@ -392,6 +681,7 @@ struct ContentView: View {
 struct SyncedMarkdownEditor: NSViewRepresentable {
     @Binding var text: String
     let onScrollChange: (Double) -> Void
+    let onOpenFiles: ([URL]) -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
 
@@ -403,7 +693,9 @@ struct SyncedMarkdownEditor: NSViewRepresentable {
         scrollView.borderType = .noBorder
         scrollView.contentView.postsBoundsChangedNotifications = true
 
-        let textView = NSTextView()
+        let textView = MarkdownSourceTextView()
+        textView.onOpenFiles = onOpenFiles
+        textView.registerForDraggedTypes(textView.registeredDraggedTypes + [.fileURL])
         textView.string = text
         textView.font = .monospacedSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
         textView.textColor = .labelColor
@@ -424,6 +716,7 @@ struct SyncedMarkdownEditor: NSViewRepresentable {
 
     func updateNSView(_ scrollView: NSScrollView, context: Context) {
         context.coordinator.parent = self
+        (scrollView.documentView as? MarkdownSourceTextView)?.onOpenFiles = onOpenFiles
         guard let textView = scrollView.documentView as? NSTextView, textView.string != text else { return }
         textView.string = text
     }
@@ -462,22 +755,53 @@ struct SyncedMarkdownEditor: NSViewRepresentable {
     }
 }
 
+final class MarkdownSourceTextView: NSTextView {
+    var onOpenFiles: (([URL]) -> Void)?
+
+    private func fileURLs(from sender: NSDraggingInfo) -> [URL] {
+        (sender.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL]) ?? []
+    }
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        fileURLs(from: sender).isEmpty ? super.draggingEntered(sender) : .copy
+    }
+
+    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+        fileURLs(from: sender).isEmpty ? super.draggingUpdated(sender) : .copy
+    }
+
+    override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        fileURLs(from: sender).isEmpty ? super.prepareForDragOperation(sender) : true
+    }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        let urls = fileURLs(from: sender)
+        guard !urls.isEmpty else { return super.performDragOperation(sender) }
+        onOpenFiles?(urls)
+        return true
+    }
+}
+
 struct MarkdownPreview: NSViewRepresentable {
     let markdown: String
     let baseURL: URL?
     let scrollProgress: Double
+    let onOpenFiles: ([URL]) -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     func makeNSView(context: Context) -> WKWebView {
         let configuration = WKWebViewConfiguration()
-        let view = WKWebView(frame: .zero, configuration: configuration)
+        let view = MarkdownFileDropWebView(frame: .zero, configuration: configuration)
+        view.onOpenFiles = onOpenFiles
+        view.registerForDraggedTypes(view.registeredDraggedTypes + [.fileURL])
         view.setValue(false, forKey: "drawsBackground")
         view.navigationDelegate = context.coordinator
         return view
     }
 
     func updateNSView(_ view: WKWebView, context: Context) {
+        (view as? MarkdownFileDropWebView)?.onOpenFiles = onOpenFiles
         let html = MarkdownRenderer.documentHTML(markdown: markdown, title: "预览")
         context.coordinator.scrollProgress = scrollProgress
         let basePath = baseURL?.path
@@ -508,19 +832,23 @@ struct MarkdownPreview: NSViewRepresentable {
 struct RenderedMarkdownEditor: NSViewRepresentable {
     @Binding var markdown: String
     let baseURL: URL?
+    let onOpenFiles: ([URL]) -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
 
     func makeNSView(context: Context) -> WKWebView {
         let configuration = WKWebViewConfiguration()
         configuration.userContentController.add(context.coordinator, name: "markdownChanged")
-        let view = WKWebView(frame: .zero, configuration: configuration)
+        let view = MarkdownFileDropWebView(frame: .zero, configuration: configuration)
+        view.onOpenFiles = onOpenFiles
+        view.registerForDraggedTypes(view.registeredDraggedTypes + [.fileURL])
         view.setValue(false, forKey: "drawsBackground")
         view.navigationDelegate = context.coordinator
         return view
     }
 
     func updateNSView(_ view: WKWebView, context: Context) {
+        (view as? MarkdownFileDropWebView)?.onOpenFiles = onOpenFiles
         context.coordinator.parent = self
         let basePath = baseURL?.path
         if context.coordinator.acceptingRenderedEdit {
@@ -553,38 +881,42 @@ struct RenderedMarkdownEditor: NSViewRepresentable {
     }
 }
 
-enum PDFExporter {
-    @MainActor
-    static func export(webView: WKWebView, html: String, baseURL: URL?, to url: URL, completion: @escaping @MainActor (Result<Void, Error>) -> Void) {
-        let observer = NavigationObserver { result in
-            switch result {
-            case .success:
-                let printInfo = NSPrintInfo.shared.copy() as! NSPrintInfo
-                printInfo.paperSize = NSSize(width: 595.28, height: 841.89) // A4, in points
-                printInfo.leftMargin = 42
-                printInfo.rightMargin = 42
-                printInfo.topMargin = 48
-                printInfo.bottomMargin = 48
-                printInfo.horizontalPagination = .fit
-                printInfo.verticalPagination = .automatic
-                printInfo.isHorizontallyCentered = true
-                printInfo.isVerticallyCentered = false
-                printInfo.jobDisposition = .save
-                printInfo.dictionary()[NSPrintInfo.AttributeKey.jobSavingURL] = url
+/// WebKit normally navigates to dropped files. Route them to the editor instead.
+final class MarkdownFileDropWebView: WKWebView {
+    var onOpenFiles: (([URL]) -> Void)?
 
-                let operation = webView.printOperation(with: printInfo)
-                operation.showsPrintPanel = false
-                operation.showsProgressPanel = false
-                if operation.run(), FileManager.default.fileExists(atPath: url.path) {
-                    completion(.success(()))
-                } else {
-                    completion(.failure(PDFExportError.couldNotCreateFile))
-                }
-            case .failure(let error): completion(.failure(error))
-            }
-        }
-        webView.navigationDelegate = observer
-        objc_setAssociatedObject(webView, Unmanaged.passUnretained(webView).toOpaque(), observer, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+    private func fileURLs(from sender: NSDraggingInfo) -> [URL] {
+        (sender.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL]) ?? []
+    }
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        fileURLs(from: sender).isEmpty ? super.draggingEntered(sender) : .copy
+    }
+
+    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+        fileURLs(from: sender).isEmpty ? super.draggingUpdated(sender) : .copy
+    }
+
+    override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        fileURLs(from: sender).isEmpty ? super.prepareForDragOperation(sender) : true
+    }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        let urls = fileURLs(from: sender)
+        guard !urls.isEmpty else { return super.performDragOperation(sender) }
+        onOpenFiles?(urls)
+        return true
+    }
+}
+
+@MainActor
+enum PDFExporter {
+    private static var jobs: [UUID: ExportJob] = [:]
+
+    static func export(webView: WKWebView, window: NSWindow, html: String, baseURL: URL?, to url: URL, completion: @escaping @MainActor (Result<Void, Error>) -> Void) {
+        let job = ExportJob(webView: webView, window: window, destination: url, completion: completion)
+        jobs[job.id] = job
+        webView.navigationDelegate = job
         webView.loadHTMLString(html, baseURL: baseURL)
     }
 
@@ -593,12 +925,88 @@ enum PDFExporter {
         var errorDescription: String? { "系统未能完成 PDF 文件写入。" }
     }
 
-    private final class NavigationObserver: NSObject, WKNavigationDelegate {
+    @MainActor private final class ExportJob: NSObject, WKNavigationDelegate {
+        let id = UUID()
+        let webView: WKWebView
+        private weak var window: NSWindow?
+        let destination: URL
+        let temporaryPDF = FileManager.default.temporaryDirectory.appendingPathComponent("MarkdownStudio-export-\(UUID().uuidString).pdf")
         let completion: @MainActor (Result<Void, Error>) -> Void
-        init(completion: @escaping @MainActor (Result<Void, Error>) -> Void) { self.completion = completion }
-        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) { completion(.success(())) }
-        func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { completion(.failure(error)) }
-        func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { completion(.failure(error)) }
+        private var operation: NSPrintOperation?
+        private var started = false
+
+        init(webView: WKWebView, window: NSWindow, destination: URL, completion: @escaping @MainActor (Result<Void, Error>) -> Void) {
+            self.webView = webView
+            self.window = window
+            self.destination = destination
+            self.completion = completion
+        }
+
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            guard !started else { return }
+            started = true
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                do {
+                    _ = try await webView.callAsyncJavaScript("await document.fonts.ready;", arguments: [:], in: nil, contentWorld: .page)
+                    self.beginPrinting()
+                } catch { self.finish(.failure(error)) }
+            }
+        }
+
+        private func beginPrinting() {
+            guard let window else {
+                finish(.failure(PDFExportError.couldNotCreateFile))
+                return
+            }
+            let printInfo = NSPrintInfo(dictionary: [:])
+            printInfo.paperSize = NSSize(width: 595.28, height: 841.89)
+            printInfo.leftMargin = 42
+            printInfo.rightMargin = 42
+            printInfo.topMargin = 48
+            printInfo.bottomMargin = 48
+            printInfo.horizontalPagination = .fit
+            printInfo.verticalPagination = .automatic
+            printInfo.isHorizontallyCentered = true
+            printInfo.isVerticallyCentered = false
+            printInfo.jobDisposition = .save
+            printInfo.dictionary()[NSPrintInfo.AttributeKey.jobSavingURL] = temporaryPDF
+            printInfo.dictionary()[NSPrintInfo.AttributeKey.allPages] = true
+            let operation = webView.printOperation(with: printInfo)
+            self.operation = operation
+            operation.showsPrintPanel = false
+            operation.showsProgressPanel = true
+            // WebKit needs the main run loop to calculate pagination. Synchronous
+            // run() on the main thread can interpret its pending page count as Int.max.
+            operation.canSpawnSeparateThread = true
+            operation.runModal(for: window, delegate: self, didRun: #selector(printOperationDidRun(_:success:contextInfo:)), contextInfo: nil)
+        }
+
+        @objc nonisolated private func printOperationDidRun(_ operation: NSPrintOperation, success: Bool, contextInfo: UnsafeMutableRawPointer?) {
+            DispatchQueue.main.async { self.finishPrinting(success: success) }
+        }
+
+        private func finishPrinting(success: Bool) {
+            do {
+                guard success else { throw PDFExportError.couldNotCreateFile }
+                let data = try Data(contentsOf: temporaryPDF)
+                guard !data.isEmpty else { throw PDFExportError.couldNotCreateFile }
+                // Leave an existing PDF untouched if rendering or writing fails.
+                try data.write(to: destination, options: .atomic)
+                finish(.success(()))
+            } catch { finish(.failure(error)) }
+        }
+
+        private func finish(_ result: Result<Void, Error>) {
+            guard jobs.removeValue(forKey: id) != nil else { return }
+            webView.navigationDelegate = nil
+            operation = nil
+            try? FileManager.default.removeItem(at: temporaryPDF)
+            completion(result)
+        }
+
+        func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { finish(.failure(error)) }
+        func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { finish(.failure(error)) }
     }
 }
 
