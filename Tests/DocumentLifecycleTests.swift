@@ -75,6 +75,32 @@ enum DocumentLifecycleTests {
         encodedDocument.isDirty = true
         try check(encodedDocument.save(), "Save UTF-16 document")
         try check(try MarkdownFileIO.read(encoded).encoding == .utf16, "Document save retains encoding")
+        try check(EditorDisplayMode.source.showsSource && !EditorDisplayMode.source.showsPreview, "Source-only mode")
+        try check(EditorDisplayMode.split.showsSource && EditorDisplayMode.split.showsPreview, "Split mode")
+        try check(!EditorDisplayMode.reading.showsSource && EditorDisplayMode.reading.showsPreview, "Read-only mode hides source")
+        try check(EditorDisplayMode(rawValue: EditorDisplayMode.reading.rawValue) == .reading, "Reading mode can be persisted")
+        let defaultsName = "MarkdownStudio-options-tests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: defaultsName)!
+        defer { defaults.removePersistentDomain(forName: defaultsName) }
+        try check(PDFExportOptions.load(from: defaults).normalizedFontSize == 16, "Default PDF font size")
+        PDFExportOptions(style: .night, fontSize: 22).save(to: defaults)
+        let remembered = PDFExportOptions.load(from: defaults)
+        try check(remembered.style == .night && remembered.fontSize == 22, "Remember PDF options")
+        try check(PDFExportOptions(style: .clean, fontSize: .nan).normalizedFontSize == 16, "Reject non-finite font size")
+        try check(PDFExportOptions(style: .clean, fontSize: 100).normalizedFontSize == 26, "Clamp large font size")
+        try check(PDFExportOptions(style: .clean, fontSize: 0).normalizedFontSize == 11, "Clamp small font size")
+        let plannerHeight = Double(PDFPageLayout.contentHeight)
+        let plainPages = try PDFPageLayout.slices(for: .init(height: plannerHeight * 2 + 10, ranges: []))
+        try check(plainPages.count == 3, "Paginate full document")
+        try check(abs(plainPages.last!.maxY - (plannerHeight * 2 + 10)) < 0.01, "Pagination includes last pixels")
+        let paragraphPages = try PDFPageLayout.slices(for: .init(height: plannerHeight + 120, ranges: [.init(start: plannerHeight - 60, end: plannerHeight + 60)]))
+        try check(paragraphPages.first!.maxY == plannerHeight - 60, "Avoid splitting a paragraph or table row")
+        try check(paragraphPages[0].maxY == paragraphPages[1].minY, "Page slices remain contiguous")
+        try check(try PDFPageLayout.slices(for: .init(height: 0, ranges: [])).count == 1, "Empty document still has one page")
+        do {
+            _ = try PDFPageLayout.slices(for: .init(height: .infinity, ranges: []))
+            throw NSError(domain: "DocumentLifecycleTests", code: 2)
+        } catch PDFExporter.PDFExportError.invalidLayout { checks += 1 }
         print("Document lifecycle tests passed: \(checks) checks.")
     }
 }

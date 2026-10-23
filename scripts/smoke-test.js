@@ -5,6 +5,7 @@ const path = require('node:path');
 const root = path.resolve(__dirname, '..');
 const source = fs.readFileSync(path.join(root, 'Sources/MarkdownStudioApp.swift'), 'utf8');
 const info = fs.readFileSync(path.join(root, 'Info.plist'), 'utf8');
+const exporter = fs.readFileSync(path.join(root, 'Sources/PDFExporter.swift'), 'utf8');
 const { marked } = require(path.join(root, 'Sources/Resources/marked.min.js'));
 const katex = require(path.join(root, 'Sources/Resources/katex.min.js'));
 
@@ -29,11 +30,20 @@ for (const requirement of [
   'keyboardShortcut("w", modifiers: .command)',
   'Window("Markdown Studio", id: "editor")',
   'windowShouldClose',
-  'operation.canSpawnSeparateThread = true',
-  'operation.runModal(for: window',
+  'case source, split, reading',
+  'Picker("显示模式", selection: $displayMode)',
+  'if displayMode.showsSource',
+  'if displayMode.showsPreview',
+  'displayMode == .split ? editorScrollProgress : nil',
+  'panel.beginSheetModal(for: window)',
   'print-color-adjust: exact',
   'katex.renderToString'
 ]) expect(source.includes(requirement), `Missing source requirement: ${requirement}`);
+
+for (const requirement of ['webView.pdf(configuration: configuration)', 'PDFPageLayout.slices', '.atomic', 'func cancel()', 'timedOut']) {
+  expect(exporter.includes(requirement), `Missing PDF export requirement: ${requirement}`);
+}
+expect(!exporter.includes('printOperation('), 'PDF export must not depend on a system print operation');
 
 for (const requirement of ['CFBundleIconFile', 'AppIcon', 'CFBundleDocumentTypes', 'LSItemContentTypes', 'UTImportedTypeDeclarations', 'net.daringfireball.markdown']) {
   expect(info.includes(requirement), `Missing app metadata: ${requirement}`);
