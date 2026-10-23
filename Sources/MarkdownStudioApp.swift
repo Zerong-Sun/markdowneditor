@@ -29,6 +29,8 @@ struct MarkdownStudioApp: App {
                     .keyboardShortcut("s", modifiers: .command)
                 Button("另存为…") { workspace.selectedDocument.saveAs() }
                     .keyboardShortcut("s", modifiers: [.command, .shift])
+                Button("从磁盘重新载入") { workspace.selectedDocument.reloadFromDisk() }
+                    .disabled(workspace.selectedDocument.fileURL == nil)
             }
             CommandGroup(after: .saveItem) {
                 Button("关闭当前文档") {
@@ -92,6 +94,7 @@ final class MarkdownStudioAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        workspace?.windowCloseApproved = false
         if !flag { workspace?.showEditor?() }
         return true
     }
@@ -114,6 +117,7 @@ final class MarkdownWorkspace: ObservableObject {
         let welcome = MarkdownDocument()
         documents = [welcome]
         selectedID = welcome.id
+        welcome.workspace = self
     }
 
     var selectedDocument: MarkdownDocument {
@@ -142,10 +146,11 @@ final class MarkdownWorkspace: ObservableObject {
     }
 
     func openDocuments(_ urls: [URL]) {
+        windowCloseApproved = false
         var errors: [String] = []
         for url in urls {
             let normalizedURL = url.standardizedFileURL.resolvingSymlinksInPath()
-            if let existing = documents.first(where: { $0.fileURL?.standardizedFileURL.resolvingSymlinksInPath() == normalizedURL }) {
+            if let existing = documents.first(where: { document in document.fileURL.map { MarkdownFileIO.refersToSameFile($0, normalizedURL) } == true }) {
                 selectedID = existing.id
                 continue
             }
@@ -160,6 +165,8 @@ final class MarkdownWorkspace: ObservableObject {
     }
 
     private func add(_ document: MarkdownDocument) {
+        windowCloseApproved = false
+        document.workspace = self
         // Replace only the untouched welcome tab. Never overwrite an edited document.
         if documents.count == 1, documents[0].fileURL == nil, !documents[0].isDirty {
             documents = [document]
@@ -174,6 +181,7 @@ final class MarkdownWorkspace: ObservableObject {
         guard document.shouldDiscardChanges() else { return }
         let remaining = documents.filter { $0.id != document.id }
         documents = remaining.isEmpty ? [MarkdownDocument()] : remaining
+        documents.forEach { $0.workspace = self }
         if selectedID == document.id { selectedID = documents[min(index, documents.count - 1)].id }
     }
 
@@ -184,6 +192,7 @@ final class MarkdownWorkspace: ObservableObject {
 
 @MainActor
 final class MarkdownDocument: ObservableObject {
+    enum UnsavedChangesChoice { case save, cancel, discard }
     let id = UUID()
     @Published var text: String = MarkdownExamples.defaultDocument
     @Published var fileURL: URL?
@@ -197,6 +206,11 @@ final class MarkdownDocument: ObservableObject {
     private var exportOptionsPanel: PDFExportOptionsPanel?
     private var exportSavePanel: NSSavePanel?
     private var encoding: String.Encoding = .utf8
+    private var diskRevision: MarkdownFileIO.Revision?
+    private var savedText = MarkdownExamples.defaultDocument
+    weak var workspace: MarkdownWorkspace?
+    let sourceEditorState = MarkdownSourceEditorState()
+    var confirmUnsavedChanges: @MainActor (String) -> UnsavedChangesChoice = MarkdownDocument.presentUnsavedChangesAlert
     private let pdfDefaults: UserDefaults
 
     init(pdfDefaults: UserDefaults = .standard) { self.pdfDefaults = pdfDefaults }
@@ -205,8 +219,9 @@ final class MarkdownDocument: ObservableObject {
 
     func edit(_ newText: String) {
         guard newText != text else { return }
+        workspace?.windowCloseApproved = false
         text = newText
-        isDirty = true
+        isDirty = text != savedText
         notice = nil
     }
 
@@ -221,6 +236,9 @@ final class MarkdownDocument: ObservableObject {
             text = initialText
             fileURL = destination
             encoding = .utf8
+            diskRevision = MarkdownFileIO.Revision(data: Data(initialText.utf8))
+            savedText = initialText
+            sourceEditorState.reset()
             errorMessage = nil
             isDirty = false
             notice = "已在下载目录创建：\(destination.lastPathComponent)"
@@ -237,6 +255,9 @@ final class MarkdownDocument: ObservableObject {
             let loaded = try MarkdownFileIO.read(url)
             text = loaded.text
             encoding = loaded.encoding
+            diskRevision = loaded.revision
+            savedText = loaded.text
+            sourceEditorState.reset()
             fileURL = url
             errorMessage = nil
             isDirty = false
@@ -251,33 +272,62 @@ final class MarkdownDocument: ObservableObject {
 
     func shouldDiscardChanges() -> Bool {
         guard isDirty else { return true }
+        switch confirmUnsavedChanges(displayName) {
+        case .save: return save()
+        case .discard: return true
+        case .cancel: return false
+        }
+    }
+
+    private static func presentUnsavedChangesAlert(_ name: String) -> UnsavedChangesChoice {
         let alert = NSAlert()
-        alert.messageText = "保存“\(displayName)”的更改？"
+        alert.messageText = "保存“\(name)”的更改？"
         alert.informativeText = "保存后再继续，或选择不保存。"
         alert.alertStyle = .warning
         alert.addButton(withTitle: "保存")
         alert.addButton(withTitle: "取消")
         alert.addButton(withTitle: "不保存")
         switch alert.runModal() {
-        case .alertFirstButtonReturn: return save()
-        case .alertThirdButtonReturn: return true
-        default: return false
+        case .alertFirstButtonReturn: return .save
+        case .alertThirdButtonReturn: return .discard
+        default: return .cancel
         }
     }
 
     @discardableResult
     func save() -> Bool {
         guard let url = fileURL else { return saveAs() }
+        return save(to: url)
+    }
+
+    /// Shared by Save and Save As, and directly exercised without a modal panel.
+    @discardableResult
+    func save(to url: URL) -> Bool {
         do {
-            try MarkdownFileIO.write(text, to: url, encoding: encoding)
+            let canonical = url.standardizedFileURL.resolvingSymlinksInPath()
+            if workspace?.documents.contains(where: { $0 !== self && $0.fileURL.map { MarkdownFileIO.refersToSameFile($0, canonical) } == true }) == true {
+                errorMessage = "此位置已在另一个标签中打开。请选择其他文件名，避免覆盖另一个文档。"
+                return false
+            }
+            let isCurrentFile = fileURL.map { MarkdownFileIO.refersToSameFile($0, canonical) } == true
+            let revision = try MarkdownFileIO.write(text, to: url, encoding: encoding, expectedRevision: isCurrentFile ? diskRevision : nil)
+            fileURL = url
+            diskRevision = revision
+            savedText = text
             errorMessage = nil
             isDirty = false
             notice = "已保存"
+            NSDocumentController.shared.noteNewRecentDocumentURL(url)
             return true
         } catch {
             errorMessage = "无法保存文件：\(error.localizedDescription)"
             return false
         }
+    }
+
+    func reloadFromDisk() {
+        guard let fileURL, shouldDiscardChanges() else { return }
+        _ = load(fileURL)
     }
 
     @discardableResult
@@ -291,16 +341,9 @@ final class MarkdownDocument: ObservableObject {
         panel.directoryURL = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
         if panel.runModal() == .OK, let url = panel.url {
             let destination = url.pathExtension.isEmpty ? url.appendingPathExtension("md") : url
-            do {
-                try MarkdownFileIO.write(text, to: destination, encoding: encoding)
-                fileURL = destination
-                errorMessage = nil
-                isDirty = false
+            if save(to: destination) {
                 notice = "已保存：\(destination.lastPathComponent)"
-                NSDocumentController.shared.noteNewRecentDocumentURL(destination)
                 return true
-            } catch {
-                errorMessage = "无法另存为：\(error.localizedDescription)"
             }
         }
         return false
@@ -429,8 +472,10 @@ struct PDFExportOptions {
         :root { color-scheme: light; }
         html,body { margin: 0; padding: 0; max-width: none; width: 100%; box-sizing: border-box; }
         body { display: flow-root; font-size: \(Int(normalizedFontSize))pt; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+        #content { overflow-wrap: anywhere; }
         #content > :first-child { margin-top: 0; }
         pre { white-space: pre-wrap; overflow: visible; overflow-wrap: anywhere; }
+        table { table-layout: fixed; }
         td,th { overflow-wrap: anywhere; }
         img { max-height: \(PDFPageLayout.contentHeight)px; object-fit: contain; }
         """
@@ -458,7 +503,9 @@ final class PDFExportOptionsView: NSView {
     private let fontValue = NSTextField(labelWithString: "16 pt")
 
     var options: PDFExportOptions {
-        PDFExportOptions(style: PDFExportStyle.allCases[stylePopup.indexOfSelectedItem], fontSize: CGFloat(fontSlider.doubleValue))
+        let styles = PDFExportStyle.allCases
+        let index = stylePopup.indexOfSelectedItem
+        return PDFExportOptions(style: styles.indices.contains(index) ? styles[index] : .clean, fontSize: CGFloat(fontSlider.doubleValue))
     }
 
     init(options: PDFExportOptions = .load()) {
@@ -710,7 +757,7 @@ struct ContentView: View {
                         SyncedMarkdownEditor(text: Binding(
                             get: { document.text },
                             set: { document.edit($0) }
-                        ), onScrollChange: { editorScrollProgress = $0 }, onOpenFiles: workspace.openDocuments)
+                        ), state: document.sourceEditorState, onScrollChange: { editorScrollProgress = $0 }, onOpenFiles: { [weak workspace] in workspace?.openDocuments($0) })
                     }
                     .frame(minWidth: 380)
                 }
@@ -725,14 +772,14 @@ struct ContentView: View {
                                     set: { document.edit($0) }
                                 ),
                                 baseURL: document.fileURL?.deletingLastPathComponent(),
-                                onOpenFiles: workspace.openDocuments
+                                onOpenFiles: { [weak workspace] in workspace?.openDocuments($0) }
                             )
                         } else {
                             MarkdownPreview(
                                 markdown: document.text,
                                 baseURL: document.fileURL?.deletingLastPathComponent(),
                                 scrollProgress: displayMode == .split ? editorScrollProgress : nil,
-                                onOpenFiles: workspace.openDocuments
+                                onOpenFiles: { [weak workspace] in workspace?.openDocuments($0) }
                             )
                         }
                     }
@@ -795,14 +842,34 @@ struct ContentView: View {
     }
 }
 
+/// Keep native undo/caret/scroll state with the document, not the visible mode.
+@MainActor
+final class MarkdownSourceEditorState {
+    var scrollView: NSScrollView?
+    let undoManager = UndoManager()
+
+    func reset() {
+        undoManager.removeAllActions()
+        (scrollView?.documentView as? NSTextView)?.setSelectedRange(NSRange(location: 0, length: 0))
+        scrollView?.contentView.scroll(to: .zero)
+    }
+}
+
 struct SyncedMarkdownEditor: NSViewRepresentable {
     @Binding var text: String
+    let state: MarkdownSourceEditorState
     let onScrollChange: (Double) -> Void
     let onOpenFiles: ([URL]) -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
 
     func makeNSView(context: Context) -> NSScrollView {
+        if let retained = state.scrollView, let textView = retained.documentView as? MarkdownSourceTextView {
+            textView.delegate = context.coordinator
+            textView.onOpenFiles = onOpenFiles
+            context.coordinator.startObserving(retained)
+            return retained
+        }
         let scrollView = NSScrollView()
         scrollView.hasVerticalScroller = true
         scrollView.hasHorizontalScroller = false
@@ -827,6 +894,7 @@ struct SyncedMarkdownEditor: NSViewRepresentable {
         textView.textContainerInset = NSSize(width: 14, height: 12)
         textView.delegate = context.coordinator
         scrollView.documentView = textView
+        state.scrollView = scrollView
         context.coordinator.startObserving(scrollView)
         return scrollView
     }
@@ -835,25 +903,60 @@ struct SyncedMarkdownEditor: NSViewRepresentable {
         context.coordinator.parent = self
         (scrollView.documentView as? MarkdownSourceTextView)?.onOpenFiles = onOpenFiles
         guard let textView = scrollView.documentView as? NSTextView, textView.string != text else { return }
+        // A rendered edit/reload has replaced the text. Old native undo ranges
+        // would target a different string; invalidate them and clamp selection.
+        let selected = textView.selectedRange()
+        state.undoManager.removeAllActions()
         textView.string = text
+        let length = (text as NSString).length
+        let location = min(selected.location, length)
+        textView.setSelectedRange(NSRange(location: location, length: min(selected.length, length - location)))
+    }
+
+    static func dismantleNSView(_ scrollView: NSScrollView, coordinator: Coordinator) {
+        coordinator.stopObserving()
+        if let textView = scrollView.documentView as? NSTextView, textView.delegate === coordinator { textView.delegate = nil }
     }
 
     @MainActor
     final class Coordinator: NSObject, NSTextViewDelegate {
         var parent: SyncedMarkdownEditor
         private weak var scrollView: NSScrollView?
+        private weak var observedUndoManager: UndoManager?
 
         init(parent: SyncedMarkdownEditor) { self.parent = parent }
         deinit { NotificationCenter.default.removeObserver(self) }
 
         func startObserving(_ scrollView: NSScrollView) {
+            stopObserving()
             self.scrollView = scrollView
+            observedUndoManager = parent.state.undoManager
             NotificationCenter.default.addObserver(
                 self,
                 selector: #selector(reportScrollPosition),
                 name: NSView.boundsDidChangeNotification,
                 object: scrollView.contentView
             )
+            for name in [Notification.Name.NSUndoManagerDidUndoChange, .NSUndoManagerDidRedoChange] {
+                NotificationCenter.default.addObserver(self, selector: #selector(publishUndoState), name: name, object: observedUndoManager)
+            }
+        }
+
+        func stopObserving() {
+            // NSTextView also registers its delegate with NotificationCenter.
+            // Removing every observer here silently disconnects textDidChange.
+            NotificationCenter.default.removeObserver(self, name: NSView.boundsDidChangeNotification, object: scrollView?.contentView)
+            for name in [Notification.Name.NSUndoManagerDidUndoChange, .NSUndoManagerDidRedoChange] {
+                NotificationCenter.default.removeObserver(self, name: name, object: observedUndoManager)
+            }
+            observedUndoManager = nil
+            scrollView = nil
+        }
+
+        @objc private func publishUndoState() {
+            // Undo actions retained across detachment can update text storage
+            // without NSTextView's live-edit notification. Publish the final text.
+            if let textView = scrollView?.documentView as? NSTextView { parent.text = textView.string }
         }
 
         @objc private func reportScrollPosition() {
@@ -869,6 +972,8 @@ struct SyncedMarkdownEditor: NSViewRepresentable {
             guard let textView = notification.object as? NSTextView else { return }
             parent.text = textView.string
         }
+
+        func undoManager(for view: NSTextView) -> UndoManager? { parent.state.undoManager }
     }
 }
 
@@ -914,11 +1019,13 @@ struct MarkdownPreview: NSViewRepresentable {
         view.registerForDraggedTypes(view.registeredDraggedTypes + [.fileURL])
         view.setValue(false, forKey: "drawsBackground")
         view.navigationDelegate = context.coordinator
+        context.coordinator.onOpenFiles = onOpenFiles
         return view
     }
 
     func updateNSView(_ view: WKWebView, context: Context) {
         (view as? MarkdownFileDropWebView)?.onOpenFiles = onOpenFiles
+        context.coordinator.onOpenFiles = onOpenFiles
         let html = MarkdownRenderer.documentHTML(markdown: markdown, title: "预览")
         context.coordinator.scrollProgress = scrollProgress
         let basePath = baseURL?.path
@@ -931,7 +1038,7 @@ struct MarkdownPreview: NSViewRepresentable {
         }
     }
 
-    final class Coordinator: NSObject, WKNavigationDelegate {
+    final class Coordinator: MarkdownNavigationDelegate {
         var lastHTML = ""
         var lastBasePath: String?
         var scrollProgress: Double?
@@ -962,20 +1069,22 @@ struct RenderedMarkdownEditor: NSViewRepresentable {
         view.registerForDraggedTypes(view.registeredDraggedTypes + [.fileURL])
         view.setValue(false, forKey: "drawsBackground")
         view.navigationDelegate = context.coordinator
+        context.coordinator.onOpenFiles = onOpenFiles
         return view
     }
 
     func updateNSView(_ view: WKWebView, context: Context) {
         (view as? MarkdownFileDropWebView)?.onOpenFiles = onOpenFiles
         context.coordinator.parent = self
+        context.coordinator.onOpenFiles = onOpenFiles
         let basePath = baseURL?.path
-        if context.coordinator.acceptingRenderedEdit {
+        if context.coordinator.acceptingRenderedEdit && context.coordinator.lastMarkdown == markdown && context.coordinator.lastBasePath == basePath {
             context.coordinator.acceptingRenderedEdit = false
-            context.coordinator.lastMarkdown = markdown
-            context.coordinator.lastBasePath = basePath
             return
         }
-        guard context.coordinator.lastMarkdown != markdown || context.coordinator.lastBasePath != basePath else { return }
+        context.coordinator.acceptingRenderedEdit = false
+        guard !context.coordinator.hasLoadedDocument || context.coordinator.lastMarkdown != markdown || context.coordinator.lastBasePath != basePath else { return }
+        context.coordinator.hasLoadedDocument = true
         context.coordinator.lastMarkdown = markdown
         context.coordinator.lastBasePath = basePath
         view.loadHTMLString(MarkdownRenderer.documentHTML(markdown: markdown, title: "渲染编辑", editable: true), baseURL: baseURL)
@@ -988,13 +1097,14 @@ struct RenderedMarkdownEditor: NSViewRepresentable {
     }
 
     @MainActor
-    final class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
+    final class Coordinator: MarkdownNavigationDelegate, WKScriptMessageHandler {
         var parent: RenderedMarkdownEditor
         var lastMarkdown = ""
         var lastBasePath: String?
         var acceptingRenderedEdit = false
+        var hasLoadedDocument = false
 
-        init(parent: RenderedMarkdownEditor) { self.parent = parent }
+        init(parent: RenderedMarkdownEditor) { self.parent = parent; super.init() }
 
         func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
             guard message.name == "markdownChanged", let value = message.body as? String else { return }
@@ -1048,6 +1158,7 @@ enum MarkdownRenderer {
 
     private static let markedScript = resourceText("marked.min", "js")
     private static let katexScript = resourceText("katex.min", "js")
+    private static let editorScript = resourceText("editor-runtime", "js")
     private static let katexCSS: String = {
         let fontsURL = resourceBundle.resourceURL?.appendingPathComponent("fonts/", isDirectory: true).absoluteString ?? ""
         return resourceText("katex.min", "css").replacingOccurrences(of: "url(fonts/", with: "url(\(fontsURL)")
@@ -1062,105 +1173,7 @@ enum MarkdownRenderer {
         <script>
         const source = \(scriptString(markdown));
         const renderEditing = \(editable ? "true" : "false");
-        const rawHTML = marked.parse(source, { gfm: true, breaks: false });
-        const safe = new DOMParser().parseFromString(rawHTML, 'text/html');
-        safe.querySelectorAll('script, style, iframe, frame, frameset, object, embed, form, button, textarea, select, option, link, meta, base, svg, math').forEach(node => node.remove());
-        safe.querySelectorAll('input').forEach(node => {
-          if (node.getAttribute('type') !== 'checkbox') node.remove();
-          else [...node.attributes].forEach(attr => { if (!['type', 'checked', 'disabled'].includes(attr.name.toLowerCase())) node.removeAttribute(attr.name); });
-        });
-        safe.querySelectorAll('*').forEach(node => {
-          [...node.attributes].forEach(attr => {
-            const name = attr.name.toLowerCase(); const value = attr.value.trim().toLowerCase();
-            if (name.startsWith('on') || name === 'style' || name === 'srcdoc' || ((name === 'href' || name === 'src') && (value.startsWith('javascript:') || value.startsWith('data:text/html')))) node.removeAttribute(attr.name);
-          });
-        });
-        document.getElementById('content').innerHTML = safe.body.innerHTML;
-        const content = document.getElementById('content');
-        const textNodes = [];
-        const walker = document.createTreeWalker(content, NodeFilter.SHOW_TEXT, {
-          acceptNode(node) { return node.parentElement && !node.parentElement.closest('code, pre, kbd, script, style') ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT; }
-        });
-        while (walker.nextNode()) textNodes.push(walker.currentNode);
-        const mathPattern = /(^|[^\\\\])(?:\\$\\$([\\s\\S]+?)\\$\\$|\\$([^$\\n]+?)\\$)/g;
-        textNodes.forEach(node => {
-          const text = node.nodeValue;
-          let match, lastIndex = 0, changed = false;
-          const fragment = document.createDocumentFragment();
-          while ((match = mathPattern.exec(text)) !== null) {
-            changed = true;
-            const prefixEnd = match.index + match[1].length;
-            fragment.append(document.createTextNode(text.slice(lastIndex, prefixEnd)));
-            const expression = (match[2] ?? match[3]).trim();
-            const wrapper = document.createElement(match[2] ? 'div' : 'span');
-            wrapper.dataset.markdownMath = expression;
-            wrapper.dataset.displayMath = Boolean(match[2]).toString();
-            wrapper.innerHTML = katex.renderToString(expression, { throwOnError: false, displayMode: Boolean(match[2]) });
-            fragment.append(wrapper);
-            lastIndex = match.index + match[0].length;
-          }
-          if (changed) { fragment.append(document.createTextNode(text.slice(lastIndex))); node.replaceWith(fragment); }
-        });
-        function inlineMarkdown(node) {
-          if (node.nodeType === Node.TEXT_NODE) return node.nodeValue;
-          if (node.nodeType !== Node.ELEMENT_NODE) return '';
-          if (node.dataset && node.dataset.markdownMath) return node.dataset.displayMath === 'true' ? `$$\\n${node.dataset.markdownMath}\\n$$` : `$${node.dataset.markdownMath}$`;
-          const value = Array.from(node.childNodes).map(inlineMarkdown).join('');
-          switch (node.tagName) {
-            case 'STRONG': case 'B': return `**${value}**`;
-            case 'EM': case 'I': return `*${value}*`;
-            case 'DEL': case 'S': return `~~${value}~~`;
-            case 'CODE': return `\\`${node.textContent.replace(/`/g, '\\\\`')}\\``;
-            case 'A': return `[${value}](${node.getAttribute('href') || ''})`;
-            case 'IMG': return `![${node.getAttribute('alt') || ''}](${node.getAttribute('src') || ''})`;
-            case 'BR': return '  \\n';
-            case 'INPUT': return node.checked ? '[x] ' : '[ ] ';
-            default: return value;
-          }
-        }
-        function listMarkdown(list, depth = 0) {
-          return Array.from(list.children).filter(node => node.tagName === 'LI').map((item, index) => {
-            const prefix = list.tagName === 'OL' ? `${index + 1}. ` : '- ';
-            const own = Array.from(item.childNodes).filter(node => !['UL', 'OL'].includes(node.tagName)).map(inlineMarkdown).join('').trim();
-            const nested = Array.from(item.children).filter(node => ['UL', 'OL'].includes(node.tagName)).map(node => listMarkdown(node, depth + 1)).join('');
-            return `${'  '.repeat(depth)}${prefix}${own}\\n${nested}`;
-          }).join('');
-        }
-        function tableMarkdown(table) {
-          const rows = Array.from(table.querySelectorAll('tr'));
-          if (!rows.length) return '';
-          const row = element => Array.from(element.children).map(cell => inlineMarkdown(cell).replace(/\\|/g, '\\\\|').trim());
-          const header = row(rows[0]);
-          const divider = header.map((_, index) => {
-            const headerCell = rows[0].children[index];
-            const align = headerCell?.getAttribute('align') || headerCell?.style.textAlign;
-            return align === 'center' ? ':---:' : align === 'right' ? '---:' : ':---';
-          });
-          return [header, divider, ...rows.slice(1).map(row)].map(cells => `| ${cells.join(' | ')} |`).join('\\n');
-        }
-        function blockMarkdown(node) {
-          if (node.nodeType === Node.TEXT_NODE) return node.nodeValue.trim();
-          if (node.nodeType !== Node.ELEMENT_NODE) return '';
-          const children = () => Array.from(node.childNodes).map(blockMarkdown).filter(Boolean).join('\\n\\n');
-          const text = inlineMarkdown(node).trim();
-          if (/^H[1-6]$/.test(node.tagName)) return `${'#'.repeat(Number(node.tagName[1]))} ${text}`;
-          if (node.tagName === 'P') return text;
-          if (node.tagName === 'PRE') { const code = node.textContent.replace(/\\n$/, ''); const language = node.querySelector('code')?.className.match(/language-([^\\s]+)/)?.[1] || ''; return `\\`\\`\\`${language}\\n${code}\\n\\`\\`\\``; }
-          if (node.tagName === 'BLOCKQUOTE') return children().split('\\n').map(line => `> ${line}`).join('\\n');
-          if (node.tagName === 'UL' || node.tagName === 'OL') return listMarkdown(node).trim();
-          if (node.tagName === 'TABLE') return tableMarkdown(node);
-          if (node.tagName === 'HR') return '---';
-          if (node.tagName === 'IMG') return text;
-          return children() || text;
-        }
-        function renderedToMarkdown(root) { return Array.from(root.childNodes).map(blockMarkdown).filter(Boolean).join('\\n\\n').replace(/\\n{3,}/g, '\\n\\n').trim() + '\\n'; }
-        if (renderEditing) {
-          content.contentEditable = 'true';
-          content.spellcheck = true;
-          content.setAttribute('aria-label', '渲染编辑区');
-          content.querySelectorAll('[data-markdown-math]').forEach(node => { node.contentEditable = 'false'; });
-          content.addEventListener('input', () => window.webkit.messageHandlers.markdownChanged.postMessage(renderedToMarkdown(content)));
-        }
+        \(editorScript)
         </script></body></html>
         """
     }

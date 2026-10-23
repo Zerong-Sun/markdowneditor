@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 
 /// Compile the production models directly; no mock file-opening implementation.
 @main
@@ -34,6 +35,16 @@ enum DocumentLifecycleTests {
         try manager.createSymbolicLink(at: alias, withDestinationURL: first)
         workspace.openDocuments([alias])
         try check(workspace.documents.count == 2 && workspace.selectedDocument === document, "Symlink reuses tab")
+        let hardLink = directory.appendingPathComponent("hard-link.md")
+        try manager.linkItem(at: first, to: hardLink)
+        workspace.openDocuments([hardLink])
+        try check(workspace.documents.count == 2 && workspace.selectedDocument === document, "Hard link reuses tab")
+        let caseVariant = directory.appendingPathComponent("SECOND.md")
+        if manager.fileExists(atPath: caseVariant.path) {
+            workspace.openDocuments([caseVariant])
+            try check(workspace.documents.count == 2 && workspace.selectedDocument.fileURL == second, "Case-insensitive filename reuses tab")
+            workspace.openDocuments([first])
+        }
         workspace.openDocuments([missing])
         try check(workspace.documents.count == 2 && document.text == "# Unsaved", "Failed open preserves documents")
         try check(document.errorMessage?.contains("missing.md") == true, "Failed open names bad input")
@@ -101,6 +112,68 @@ enum DocumentLifecycleTests {
             _ = try PDFPageLayout.slices(for: .init(height: .infinity, ranges: []))
             throw NSError(domain: "DocumentLifecycleTests", code: 2)
         } catch PDFExporter.PDFExportError.invalidLayout { checks += 1 }
+
+        let conflictWorkspace = MarkdownWorkspace()
+        conflictWorkspace.openDocuments([first, second])
+        let conflict = conflictWorkspace.documents[0]
+        conflict.edit("my local edit")
+        let localText = conflict.text
+        try MarkdownFileIO.write("external edit", to: first)
+        try check(!conflict.save(), "Saving rejects external changes")
+        try check(conflict.isDirty && conflict.text == localText, "Conflict retains local draft")
+        try check(try MarkdownFileIO.read(first).text == "external edit", "Conflict retains external version")
+        try check(conflict.errorMessage?.contains("其他程序") == true, "Conflict explains recovery")
+        let copy = directory.appendingPathComponent("recovered.md")
+        try check(conflict.save(to: copy), "Save As to new path recovers draft")
+        try check(!conflict.isDirty && conflict.fileURL == copy, "Save As updates path only on success")
+        conflict.edit("another edit")
+        try check(!conflict.save(to: second), "Save As rejects another open tab's file")
+        try check(conflict.isDirty && conflict.fileURL == copy, "Duplicate target rejection preserves local state")
+        try check(try MarkdownFileIO.read(second).text == "# Second", "Duplicate target rejection preserves other file")
+        if manager.fileExists(atPath: caseVariant.path) {
+            try check(!conflict.save(to: caseVariant), "Save As detects a case variant of another open tab")
+        }
+        try check(conflict.load(copy), "Load resets baseline")
+        conflict.edit("temporary change")
+        conflict.edit(localText)
+        try check(!conflict.isDirty, "Editing/undoing back to saved text clears dirty state")
+        let external = URL(string: "https://example.com/help")!
+        let local = URL(fileURLWithPath: "/tmp/another.md")
+        try check(MarkdownLinkDestination.resolve(external, currentURL: nil) == .external(external), "HTTP links use external browser")
+        try check(MarkdownLinkDestination.resolve(local, currentURL: nil) == .markdown(local), "Markdown file links route to document workspace")
+        try check(MarkdownLinkDestination.resolve(URL(string: "x-apple.systempreferences:settings")!, currentURL: nil) == .blocked, "Arbitrary app schemes cannot launch")
+        try check(MarkdownLinkDestination.resolve(URL(string: "https://example.com/help#section")!, currentURL: external) == .anchor, "Same-document anchors remain in preview")
+        try check(MarkdownLinkDestination.resolve(URL(fileURLWithPath: "/tmp/program.command"), currentURL: nil) == .blocked, "Non-Markdown local programs cannot launch")
+        let closing = MarkdownWorkspace()
+        closing.openDocuments([first])
+        let draft = closing.selectedDocument
+        closing.windowCloseApproved = true
+        draft.edit("unsaved close test")
+        try check(!closing.windowCloseApproved, "New edits revoke any earlier window-close approval")
+        draft.confirmUnsavedChanges = { _ in .cancel }
+        closing.close(draft)
+        try check(closing.selectedDocument === draft && draft.isDirty, "Cancel close retains draft and selection")
+        try check(!closing.canCloseAllDocuments(), "Cancel blocks window close/quit")
+        let lifecycleDelegate = MarkdownStudioAppDelegate()
+        lifecycleDelegate.attach(closing)
+        try check(lifecycleDelegate.applicationShouldTerminate(NSApplication.shared) == .terminateCancel, "App delegate refuses quit on cancellation")
+        closing.windowCloseApproved = true
+        _ = lifecycleDelegate.applicationShouldHandleReopen(NSApplication.shared, hasVisibleWindows: true)
+        try check(!closing.windowCloseApproved, "Reopening revokes stale close approval")
+        draft.confirmUnsavedChanges = { _ in .save }
+        draft.fileURL = directory.appendingPathComponent("absent/cannot-save.md")
+        closing.close(draft)
+        try check(closing.selectedDocument === draft && draft.isDirty, "Save failure blocks close and retains draft")
+        draft.fileURL = first
+        try check(draft.shouldDiscardChanges(), "Successful save permits close")
+        try check(try MarkdownFileIO.read(first).text == "unsaved close test", "Close's Save decision actually writes data")
+        draft.edit("discarded version")
+        draft.confirmUnsavedChanges = { _ in .discard }
+        try check(closing.canCloseAllDocuments(), "Explicit discard permits close")
+        try check(lifecycleDelegate.applicationShouldTerminate(NSApplication.shared) == .terminateNow, "App delegate permits quit after explicit discard")
+        closing.close(draft)
+        try check(closing.selectedDocument !== draft, "Discard closes the dirty tab")
+        try check(try MarkdownFileIO.read(first).text == "unsaved close test", "Discard never writes discarded edits")
         print("Document lifecycle tests passed: \(checks) checks.")
     }
 }

@@ -15,6 +15,7 @@ let package = Package(
                 .copy("Resources/marked.min.js"),
                 .copy("Resources/katex.min.js"),
                 .copy("Resources/katex.min.css"),
+                .copy("Resources/editor-runtime.js"),
                 .copy("Resources/fonts")
             ]
         )

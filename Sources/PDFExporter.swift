@@ -125,8 +125,9 @@ enum PDFExporter {
                 return
             }
             scoped = destination.startAccessingSecurityScopedResource()
+            let safeTimeout = timeout.isFinite ? max(0.001, min(120, timeout)) : 60
             timeoutTask = Task { @MainActor [weak self] in
-                do { try await Task.sleep(for: .seconds(max(0.001, min(120, timeout)))) }
+                do { try await Task.sleep(for: .seconds(safeTimeout)) }
                 catch { return }
                 self?.finish(.failure(PDFExportError.timedOut))
             }
@@ -241,6 +242,15 @@ enum PDFExporter {
           img.addEventListener('error', resolve, {once:true});
         })));
         const content = document.getElementById('content');
+        // A long unbreakable equation must fit horizontally, not be clipped by
+        // the A4 capture rectangle. Ordinary text/tables wrap through export CSS.
+        content.querySelectorAll('[data-markdown-math]').forEach(node => {
+          const math = node.querySelector('.katex');
+          if (!math) return;
+          const available = Math.min(content.clientWidth, node.parentElement.clientWidth);
+          const width = Math.max(math.scrollWidth, math.getBoundingClientRect().width);
+          if (width > available && available > 0) math.style.fontSize = `${available / width * 0.98}em`;
+        });
         const ranges = [];
         function add(rect) {
           if (rect.height > 0 && rect.width > 0) ranges.push({start: Math.max(0, rect.top + scrollY), end: Math.max(0, rect.bottom + scrollY)});

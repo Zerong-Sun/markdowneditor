@@ -98,6 +98,20 @@ enum PDFExportIntegrationTests {
         for line in 1...90 { try check(edgeText.contains("LINE-\(line)-END"), "Code line \(line)") }
         try check(edgeText.contains("EDGE-END"), "Very long paragraph retains end")
 
+        let wideWord = "WORD-BEGIN-" + String(repeating: "ABCDEFGHIJ", count: 100) + "-WORD-END"
+        let wideTable = "CELL-BEGIN-" + String(repeating: "Z", count: 700) + "-CELL-END"
+        let wideEquation = (1...32).map { "x_{\($0)}" }.joined(separator: "+")
+        let wide = "# Horizontal overflow\n\n\(wideWord)\n\n| Wide | Value |\n| --- | --- |\n| \(wideTable) | retained |\n\n$$\n\(wideEquation)\n$$\n\nWIDE-END"
+        try run(wide, name: "wide", size: 26).get()
+        let wideText = text(try document("wide"))
+        try check(wideText.contains(wideWord), "Unbreakable paragraph is wrapped instead of clipped horizontally")
+        // PDF reading order can interleave the neighboring column mid-cell.
+        // Count unique glyphs instead of requiring a contiguous multi-page string.
+        try check(wideText.contains("CELL-BEGIN-") && wideText.contains("-CELL-END") && wideText.filter { $0 == "Z" }.count == 700, "Unbreakable table cell stays complete inside A4 width")
+        try check(wideText.contains("WIDE-END"), "Wide content retains following document content")
+        try check(wideText.contains("32") && wideText.filter { $0 == "x" }.count >= 32, "Wide equation retains all terms and final subscript")
+        try check(wideText.components(separatedBy: "WORD-BEGIN-").count == 2, "Pagination does not duplicate paragraph start")
+
         try Data(contentsOf: URL(fileURLWithPath: "Tests/Fixtures/local-image.svg")).write(to: directory.appendingPathComponent("本地 图片.svg"), options: .atomic)
         try run("# 本地图片\n\n![LOCAL-IMAGE-UNAVAILABLE](<本地 图片.svg>)\n\nLOCAL-IMAGE-END", name: "local-image").get()
         let imageText = text(try document("local-image"))
@@ -105,6 +119,8 @@ enum PDFExportIntegrationTests {
 
         try run("", name: "empty").get()
         try check(try document("empty").pageCount == 1, "Empty Markdown exports one valid page")
+        try run("# Safe timeout\n\nNONFINITE-END", name: "nonfinite-timeout", timeout: .nan).get()
+        try check(text(try document("nonfinite-timeout")).contains("NONFINITE-END"), "Non-finite timeout uses a safe default without trapping")
         let protected = directory.appendingPathComponent("protected.pdf")
         try Data("ORIGINAL".utf8).write(to: protected)
         let cancelled = try run(long, name: "cancelled", destination: protected, cancel: true)

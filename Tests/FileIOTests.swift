@@ -64,6 +64,22 @@ enum FileIOTests {
         try MarkdownFileIO.write("updated", to: link)
         try check(try MarkdownFileIO.read(first).text == "updated", "Save updates symlink target")
         try check(try manager.destinationOfSymbolicLink(atPath: link.path) == first.path, "Save preserves symlink")
+        let snapshot = try MarkdownFileIO.read(first)
+        let revision = try MarkdownFileIO.write("revision two", to: first, expectedRevision: snapshot.revision)
+        try check(revision == MarkdownFileIO.read(first).revision, "Successful write returns new content fingerprint")
+        try rejects("External change conflict") { try MarkdownFileIO.write("must not overwrite", to: first, expectedRevision: snapshot.revision) }
+        try check(try MarkdownFileIO.read(first).text == "revision two", "Conflict preserves disk content")
+        try manager.removeItem(at: first)
+        try rejects("External delete conflict") { try MarkdownFileIO.write("must not recreate", to: first, expectedRevision: revision) }
+        try check(!manager.fileExists(atPath: first.path), "Conflict does not recreate deleted file")
+        try rejects("NUL save") { try MarkdownFileIO.write("a\0b", to: empty) }
+        try check(try MarkdownFileIO.read(empty).text.isEmpty, "Rejected save preserves original bytes")
+        let oversized = directory.appendingPathComponent("oversized.md")
+        manager.createFile(atPath: oversized.path, contents: nil)
+        let handle = try FileHandle(forWritingTo: oversized)
+        try handle.truncate(atOffset: UInt64(MarkdownFileIO.maximumFileSize + 1))
+        try handle.close()
+        try rejects("Oversized sparse file") { _ = try MarkdownFileIO.read(oversized) }
         print("File lifecycle tests passed: \(checks) checks.")
     }
 }

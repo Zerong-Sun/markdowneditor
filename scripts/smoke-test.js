@@ -6,6 +6,7 @@ const root = path.resolve(__dirname, '..');
 const source = fs.readFileSync(path.join(root, 'Sources/MarkdownStudioApp.swift'), 'utf8');
 const info = fs.readFileSync(path.join(root, 'Info.plist'), 'utf8');
 const exporter = fs.readFileSync(path.join(root, 'Sources/PDFExporter.swift'), 'utf8');
+const runtime = fs.readFileSync(path.join(root, 'Sources/Resources/editor-runtime.js'), 'utf8');
 const { marked } = require(path.join(root, 'Sources/Resources/marked.min.js'));
 const katex = require(path.join(root, 'Sources/Resources/katex.min.js'));
 
@@ -21,8 +22,6 @@ expect(katex.renderToString('\\frac{a}{b}').includes('katex'), 'KaTeX did not re
 
 for (const requirement of [
   'keyboardShortcut("p", modifiers: .command)',
-  'content.contentEditable = \'true\'',
-  'markdownChanged',
   'shouldDiscardChanges',
   'applicationShouldTerminate',
   'func application(_ application: NSApplication, open urls: [URL])',
@@ -36,9 +35,11 @@ for (const requirement of [
   'if displayMode.showsPreview',
   'displayMode == .split ? editorScrollProgress : nil',
   'panel.beginSheetModal(for: window)',
-  'print-color-adjust: exact',
-  'katex.renderToString'
+  'print-color-adjust: exact'
 ]) expect(source.includes(requirement), `Missing source requirement: ${requirement}`);
+for (const requirement of ["content.contentEditable = 'true'", 'markdownChanged', 'katex.renderToString', 'sanitizeHTML', 'renderedToMarkdown']) {
+  expect(runtime.includes(requirement), `Missing renderer requirement: ${requirement}`);
+}
 
 for (const requirement of ['webView.pdf(configuration: configuration)', 'PDFPageLayout.slices', '.atomic', 'func cancel()', 'timedOut']) {
   expect(exporter.includes(requirement), `Missing PDF export requirement: ${requirement}`);
