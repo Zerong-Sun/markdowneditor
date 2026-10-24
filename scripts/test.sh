@@ -17,6 +17,8 @@ swiftc -D DOCUMENT_LIFECYCLE_TESTING \
   "$PROJECT_DIR/Sources/MarkdownFileIO.swift" \
   "$PROJECT_DIR/Sources/MarkdownNavigation.swift" \
   "$PROJECT_DIR/Sources/PDFExporter.swift" \
+  "$PROJECT_DIR/Sources/PDFExportOptions.swift" \
+  "$PROJECT_DIR/Sources/PDFExportOptionsPanel.swift" \
   "$PROJECT_DIR/Sources/MarkdownStudioApp.swift" \
   "$BUILD_DIR/MarkdownStudio.build/DerivedSources/resource_bundle_accessor.swift" \
   "$PROJECT_DIR/Tests/DocumentLifecycleTests.swift" -o "$TEST_DIR/document-tests"
@@ -25,6 +27,8 @@ swiftc -D DOCUMENT_LIFECYCLE_TESTING \
   "$PROJECT_DIR/Sources/MarkdownFileIO.swift" \
   "$PROJECT_DIR/Sources/MarkdownNavigation.swift" \
   "$PROJECT_DIR/Sources/PDFExporter.swift" \
+  "$PROJECT_DIR/Sources/PDFExportOptions.swift" \
+  "$PROJECT_DIR/Sources/PDFExportOptionsPanel.swift" \
   "$PROJECT_DIR/Sources/MarkdownStudioApp.swift" \
   "$BUILD_DIR/MarkdownStudio.build/DerivedSources/resource_bundle_accessor.swift" \
   "$PROJECT_DIR/Tests/PDFExportIntegrationTests.swift" -o "$TEST_DIR/pdf-tests"
@@ -39,6 +43,8 @@ swiftc -D DOCUMENT_LIFECYCLE_TESTING \
   "$PROJECT_DIR/Sources/MarkdownFileIO.swift" \
   "$PROJECT_DIR/Sources/MarkdownNavigation.swift" \
   "$PROJECT_DIR/Sources/PDFExporter.swift" \
+  "$PROJECT_DIR/Sources/PDFExportOptions.swift" \
+  "$PROJECT_DIR/Sources/PDFExportOptionsPanel.swift" \
   "$PROJECT_DIR/Sources/MarkdownStudioApp.swift" \
   "$BUILD_DIR/MarkdownStudio.build/DerivedSources/resource_bundle_accessor.swift" \
   "$PROJECT_DIR/Tests/EditorQualityIntegrationTests.swift" -o "$TEST_DIR/editor-quality-tests"

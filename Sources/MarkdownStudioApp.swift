@@ -357,21 +357,21 @@ final class MarkdownDocument: ObservableObject {
         }
         guard exportWindow.attachedSheet == nil else { return }
         isExportingPDF = true
-        let optionsPanel = PDFExportOptionsPanel(options: .load(from: pdfDefaults))
+        let optionsPanel = PDFExportOptionsPanel(markdown: text, title: displayName, baseURL: fileURL?.deletingLastPathComponent(), options: .load(from: pdfDefaults))
         exportOptionsPanel = optionsPanel
-        optionsPanel.beginSheet(for: exportWindow) { [weak self, weak exportWindow] options in
+        optionsPanel.beginSheet(for: exportWindow) { [weak self, weak exportWindow] selection in
             guard let self else { return }
             self.exportOptionsPanel = nil
-            guard let options, let exportWindow else {
+            guard let selection, let exportWindow else {
                 self.isExportingPDF = false
                 return
             }
-            options.save(to: self.pdfDefaults)
-            DispatchQueue.main.async { self.selectPDFDestination(options: options, window: exportWindow) }
+            selection.options.save(to: self.pdfDefaults)
+            DispatchQueue.main.async { self.selectPDFDestination(selection: selection, window: exportWindow) }
         }
     }
 
-    private func selectPDFDestination(options: PDFExportOptions, window: NSWindow) {
+    private func selectPDFDestination(selection: PDFExportSelection, window: NSWindow) {
         let panel = NSSavePanel()
         panel.title = "导出 PDF"
         panel.nameFieldStringValue = (fileURL?.deletingPathExtension().lastPathComponent ?? "Markdown 文档") + ".pdf"
@@ -387,18 +387,18 @@ final class MarkdownDocument: ObservableObject {
                 self.isExportingPDF = false
                 return
             }
-            self.beginPDFExport(to: destination, options: options)
+            self.beginPDFExport(to: destination, options: selection.options, preparedData: selection.data)
         }
     }
 
-    func beginPDFExport(to destination: URL, options: PDFExportOptions) {
+    func beginPDFExport(to destination: URL, options: PDFExportOptions, preparedData: Data? = nil) {
         guard exportTask == nil else { return }
         isExportingPDF = true
         exportProgress = 0
         exportedPDFURL = nil
         notice = "正在导出 PDF…"
         errorMessage = nil
-        exportTask = PDFExporter.export(markdown: text, title: displayName, baseURL: fileURL?.deletingLastPathComponent(), options: options, to: destination, progress: { [weak self] in
+        exportTask = PDFExporter.export(markdown: text, title: displayName, baseURL: fileURL?.deletingLastPathComponent(), options: options, to: destination, preparedData: preparedData, progress: { [weak self] in
             self?.exportProgress = $0
         }) { [weak self] result in
             guard let self else { return }
@@ -433,173 +433,6 @@ enum EditorDisplayMode: String, CaseIterable {
     var showsPreview: Bool { self != .source }
 }
 
-enum PDFExportStyle: String, CaseIterable {
-    case clean, paper, book, night
-
-    var name: String {
-        switch self {
-        case .clean: "简洁白纸"
-        case .paper: "暖色纸张"
-        case .book: "书籍衬线"
-        case .night: "夜间墨黑"
-        }
-    }
-
-    var css: String {
-        switch self {
-        case .clean: "body { color:#202124; background:#ffffff; } h1,h2 { border-color:#d9dde3; }"
-        case .paper: "body { color:#42382d; background:#fcf6e9; } h1,h2 { border-color:#d8c7a9; } th { background:#f2e7d2; } code,pre { background:#f3eadb; }"
-        case .book: "body { color:#27231e; background:#fffdf8; font-family: Georgia, 'Songti SC', 'STSong', serif; } h1,h2,h3 { font-family: -apple-system, 'PingFang SC', sans-serif; }"
-        case .night: "body { color:#e9edf2; background:#1d232d; } h1,h2 { border-color:#485363; } th { background:#293442; } td { border-color:#485363; } code,pre { background:#293442; } a { color:#8ab4f8; } blockquote { color:#b8c2cf; border-color:#7d8998; }"
-        }
-    }
-}
-
-struct MarkdownAppearance {
-    let fontSize: CGFloat
-    let additionalCSS: String
-
-    static let preview = MarkdownAppearance(fontSize: 16, additionalCSS: "")
-}
-
-struct PDFExportOptions {
-    let style: PDFExportStyle
-    let fontSize: CGFloat
-
-    var appearance: MarkdownAppearance {
-        let css = """
-        \(style.css)
-        :root { color-scheme: light; }
-        html,body { margin: 0; padding: 0; max-width: none; width: 100%; box-sizing: border-box; }
-        body { display: flow-root; font-size: \(Int(normalizedFontSize))pt; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
-        #content { overflow-wrap: anywhere; }
-        #content > :first-child { margin-top: 0; }
-        pre { white-space: pre-wrap; overflow: visible; overflow-wrap: anywhere; }
-        table { table-layout: fixed; }
-        td,th { overflow-wrap: anywhere; }
-        img { max-height: \(PDFPageLayout.contentHeight)px; object-fit: contain; }
-        """
-        return MarkdownAppearance(fontSize: normalizedFontSize, additionalCSS: css)
-    }
-
-    var normalizedFontSize: CGFloat { fontSize.isFinite ? min(26, max(11, fontSize.rounded())) : 16 }
-
-    static func load(from defaults: UserDefaults = .standard) -> PDFExportOptions {
-        let style = defaults.string(forKey: "pdf.style").flatMap(PDFExportStyle.init(rawValue:)) ?? .clean
-        let fontSize = defaults.object(forKey: "pdf.fontSize") as? Double ?? 16
-        let options = PDFExportOptions(style: style, fontSize: fontSize)
-        return PDFExportOptions(style: style, fontSize: options.normalizedFontSize)
-    }
-
-    func save(to defaults: UserDefaults = .standard) {
-        defaults.set(style.rawValue, forKey: "pdf.style")
-        defaults.set(Double(normalizedFontSize), forKey: "pdf.fontSize")
-    }
-}
-
-final class PDFExportOptionsView: NSView {
-    private let stylePopup = NSPopUpButton(frame: NSRect(x: 92, y: 52, width: 268, height: 26), pullsDown: false)
-    private let fontSlider = NSSlider(value: 16, minValue: 11, maxValue: 26, target: nil, action: nil)
-    private let fontValue = NSTextField(labelWithString: "16 pt")
-
-    var options: PDFExportOptions {
-        let styles = PDFExportStyle.allCases
-        let index = stylePopup.indexOfSelectedItem
-        return PDFExportOptions(style: styles.indices.contains(index) ? styles[index] : .clean, fontSize: CGFloat(fontSlider.doubleValue))
-    }
-
-    init(options: PDFExportOptions = .load()) {
-        super.init(frame: NSRect(x: 0, y: 0, width: 360, height: 84))
-        let styleLabel = NSTextField(labelWithString: "导出风格")
-        styleLabel.frame = NSRect(x: 0, y: 56, width: 82, height: 20)
-        addSubview(styleLabel)
-        stylePopup.addItems(withTitles: PDFExportStyle.allCases.map(\.name))
-        let previous = options
-        stylePopup.selectItem(at: PDFExportStyle.allCases.firstIndex(of: previous.style) ?? 0)
-        addSubview(stylePopup)
-
-        let sizeLabel = NSTextField(labelWithString: "正文字号")
-        sizeLabel.frame = NSRect(x: 0, y: 18, width: 82, height: 20)
-        addSubview(sizeLabel)
-        fontSlider.frame = NSRect(x: 92, y: 18, width: 210, height: 20)
-        fontSlider.target = self
-        fontSlider.action = #selector(fontSizeChanged)
-        fontSlider.numberOfTickMarks = 16
-        fontSlider.allowsTickMarkValuesOnly = true
-        fontSlider.doubleValue = Double(previous.normalizedFontSize)
-        addSubview(fontSlider)
-        fontValue.frame = NSRect(x: 312, y: 18, width: 48, height: 20)
-        fontValue.alignment = .right
-        addSubview(fontValue)
-        fontSizeChanged()
-    }
-
-    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-
-    @objc private func fontSizeChanged() {
-        fontValue.stringValue = "\(Int(fontSlider.doubleValue)) pt"
-    }
-}
-
-final class PDFExportOptionsPanel: NSPanel, NSWindowDelegate {
-    private let optionsView: PDFExportOptionsView
-
-    var options: PDFExportOptions { optionsView.options }
-
-    init(options: PDFExportOptions = .load()) {
-        optionsView = PDFExportOptionsView(options: options)
-        let contentSize = NSSize(width: 408, height: 178)
-        super.init(
-            contentRect: NSRect(origin: .zero, size: contentSize),
-            styleMask: [.titled, .closable],
-            backing: .buffered,
-            defer: false
-        )
-        title = "PDF 导出设置"
-        isReleasedWhenClosed = false
-        isMovableByWindowBackground = false
-        delegate = self
-        standardWindowButton(.zoomButton)?.isHidden = true
-        standardWindowButton(.miniaturizeButton)?.isHidden = true
-
-        let container = NSView(frame: NSRect(origin: .zero, size: contentSize))
-        contentView = container
-
-        let message = NSTextField(labelWithString: "选择导出风格和正文字号，然后选择保存位置。")
-        message.frame = NSRect(x: 24, y: 136, width: 360, height: 20)
-        container.addSubview(message)
-
-        optionsView.frame.origin = NSPoint(x: 24, y: 48)
-        container.addSubview(optionsView)
-
-        let cancel = NSButton(title: "取消", target: self, action: #selector(cancelPressed))
-        cancel.frame = NSRect(x: 208, y: 14, width: 84, height: 30)
-        cancel.keyEquivalent = "\u{1b}"
-        container.addSubview(cancel)
-
-        let proceed = NSButton(title: "继续", target: self, action: #selector(proceedPressed))
-        proceed.frame = NSRect(x: 300, y: 14, width: 84, height: 30)
-        proceed.keyEquivalent = "\r"
-        proceed.bezelStyle = .rounded
-        container.addSubview(proceed)
-        initialFirstResponder = optionsView
-    }
-
-    func beginSheet(for window: NSWindow, completion: @escaping (PDFExportOptions?) -> Void) {
-        window.beginSheet(self) { [self] response in
-            orderOut(nil)
-            completion(response == .OK ? options : nil)
-        }
-    }
-
-    @objc private func proceedPressed() { sheetParent?.endSheet(self, returnCode: .OK) }
-    @objc private func cancelPressed() { sheetParent?.endSheet(self, returnCode: .cancel) }
-
-    func windowShouldClose(_ sender: NSWindow) -> Bool {
-        cancelPressed()
-        return false
-    }
-}
 
 struct MarkdownWorkspaceView: View {
     @EnvironmentObject private var workspace: MarkdownWorkspace
@@ -1199,7 +1032,7 @@ enum MarkdownExamples {
 
 工具栏支持 **仅编辑 / 双栏 / 仅渲染**。按 `⌘3` 隐藏左侧源码、只读排版正文；按 `⌘2` 返回双栏，按 `⌘1` 仅显示源码。显示模式会记住，阅读时不会修改文件。
 
-按 `⌘P` 导出 PDF：先选择风格与字号，再选择保存位置。导出不依赖打印机，支持完整多页 A4、进度显示与取消。
+按 `⌘P` 打开 PDF 设置与真实预览：选择白纸/墨黑与衬线/无衬线四种组合，调整正文和 H1 字号、行距，以及小/中/大打印边距。上、下、左右边距分别可调，也可添加文档名页眉和页码页脚，选择 A4/Letter、横向/纵向。右侧可以翻页、缩放；预览更新完成后点“继续”选择保存位置，导出与预览一致。
 
 > 本地预览会安全地过滤脚本、嵌入网页和表单等危险 HTML；普通排版 HTML（如 `details` 和 `kbd`）可使用。
 

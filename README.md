@@ -2,9 +2,9 @@
 
 一个原生 macOS Markdown 编辑器，支持源码编辑、双栏实时预览、仅读取模式、渲染编辑和多页 PDF 导出。内置 Markdown 语法示例、GFM 解析器和 KaTeX，无需联网即可渲染本地正文与公式；网络图片仍需要网络。
 
-当前版本：**v1.5.1（build 7）**。
+最新版本：**v1.6.0（build 8）**，升级 PDF 排版设置与实际预览。
 
-[下载 Mac 应用](https://github.com/Zerong-Sun/markdowneditor/releases/download/v1.5.1/Markdown-Studio-macOS.zip) · [版本说明](https://github.com/Zerong-Sun/markdowneditor/releases/tag/v1.5.1) · [SHA-256 校验文件](https://github.com/Zerong-Sun/markdowneditor/releases/download/v1.5.1/SHA256SUMS.txt)
+[下载 Mac 应用](https://github.com/Zerong-Sun/markdowneditor/releases/download/v1.6.0/Markdown-Studio-macOS.zip) · [版本说明](https://github.com/Zerong-Sun/markdowneditor/releases/tag/v1.6.0) · [SHA-256 校验文件](https://github.com/Zerong-Sun/markdowneditor/releases/download/v1.6.0/SHA256SUMS.txt)
 
 ## 下载与安装
 
@@ -34,7 +34,7 @@ shasum -a 256 -c SHA256SUMS.txt
 - **本地文档与标签**：Finder“打开方式”、拖入文件、`⌘O` 或命令行打开；多个文件显示独立标签。支持 `.md`、`.markdown`、`.mdown`、`.mkdn`、`.mkd`、`.txt`，中文/空格路径、UTF-8 和带 BOM 的 UTF-16/UTF-32。
 - **编辑状态保护**：切换模式或标签保留源码光标与独立撤销历史；关闭文档和退出时询问未保存更改。重复打开同一文件切回已有标签，不覆盖草稿。
 - **保存保护**：检测外部修改/删除，阻止静默覆盖；另存为不会覆盖其他打开的标签。新建默认保存到 `~/Downloads`，如 `note_2026-10-24_103000.md`，重名时自动加后缀。
-- **PDF 导出**：多页 A4、四种风格、11–26 pt 字号、可选择文字、公式、可点击链接和本地图片；支持进度、取消、超时保护与原子输出，不依赖打印机。
+- **PDF 导出与实际预览**：四种“白纸/墨黑 × 衬线/无衬线”组合，正文 8–32 pt、H1 16–72 pt、三档行距。上、下、左右打印边距分别可选小/中/大；可选文档名页眉与页码页脚，页眉页脚另有三档字号。支持 A4/Letter、横竖版，预览可翻页缩放；最终导出与预览字节一致，保留可选择文字、公式、链接和图片。
 - **链接与 HTML 安全**：网页链接在默认浏览器打开，本地 Markdown 链接在应用中打开，不替换当前预览；过滤脚本、危险属性和任意应用 URL 协议。
 
 ## 常用快捷键
@@ -51,13 +51,25 @@ shasum -a 256 -c SHA256SUMS.txt
 ## 导出 PDF
 
 1. 按 `⌘P` 或点击“导出 PDF”。
-2. 选择“简洁白纸 / 暖色纸张 / 书籍衬线 / 夜间墨黑”和正文字号，点击“继续”。
-3. 在保存面板选择文件名与位置；设置会记住。
-4. 底栏显示导出进度，可取消。完成后点击“打开 PDF”查看结果。仅渲染模式同样可以导出，未保存的正文也可导出。
+2. 左侧选择风格、正文/H1 字号、行距、纸张和方向；调整上、下、左右边距（小 12 mm / 中 20 mm / 大 28 mm）。页眉页脚字号另选 8 / 10 / 12 pt，可独立勾选文档名与页码。
+3. 右侧自动更新实际 PDF，显示页数，可滚动、翻页和缩放。更新期间“继续”暂不可用，避免误保存旧预览；也可“恢复默认设置”。
+4. 预览就绪后点击“继续”，在保存面板选择文件名与位置。写入的就是预览 PDF，不会再次排版；设置会记住，取消设置面板不改变已记住的设置。完成后点击“打开 PDF”查看结果。仅渲染模式和未保存的正文同样可以导出。
+
+页眉页脚留白与文字字号互相独立：边距决定正文离纸边多远，字号决定页眉页脚文字大小。墨黑风格会打印深色背景，纸质打印通常建议白纸风格；实际可打印边缘仍受打印机硬件限制。详见 [PDF 排版与预览说明](docs/PDF_LAYOUT_AND_PREVIEW.md)。
 
 若保存遇到“文件已被其他程序修改”的提示，草稿仍保留在标签中。要保留草稿，请先另存为新文件，再打开原文件对照；要舍弃草稿并读取磁盘版本，使用文件菜单“从磁盘重新载入”，在确认框选择“不保存”。
 
-## v1.5.1 更新
+## v1.6.0 更新
+
+- PDF 风格整理为“白纸 / 墨黑 × 衬线 / 无衬线”四种组合，保留旧版字体设置迁移。
+- 正文和一级标题可独立调整字号，新增三档行距、A4 / Letter 与横竖版。
+- 上、下、左右边距分别提供小 / 中 / 大，页眉页脚字号另设三档；可独立开关文档名和页码。
+- 新增实际 PDF 预览，可翻页、缩放和适合页面；保存与预览使用同一份 PDF 数据。
+- 修改参数时自动取消旧预览、阻止导出过期结果；支持恢复默认和记住已确认设置。
+
+本机通过 **735 项检查**（文件 38、文档/参数/几何 151、PDF/面板/预览 511、编辑器 35），包含真实 PDF 字号、分页、页眉页码、边距与预览/保存逐字节一致性检查。详见 [PDF 排版与预览验证记录](docs/PDF_LAYOUT_AND_PREVIEW.md)和 [v1.6.0 发布说明](docs/RELEASE_NOTES_v1.6.0.md)。
+
+## v1.5.1 历史更新
 
 - 修复渲染编辑重写整篇文档、丢失引用定义/HTML/嵌套代码围栏的问题。
 - 修复含下划线公式的解析，以及空文档渲染编辑和中文组合输入的同步问题。
@@ -87,9 +99,9 @@ cd markdowneditor
 open -a "/Applications/Markdown Studio.app" "Tests/Fixtures/中文 打开测试.md"
 ```
 
-测试脚本检查真实文件与文档模型，并运行 WebKit PDF 导出、原生设置面板、三种显示模式、富文本回写和原生撤销/重做。默认清理测试产物；设置 `MARKDOWNSTUDIO_PDF_TEST_OUTPUT=/absolute/path` 可保留 PDF 和界面快照，首次请使用空目录。543 为检查断言数，不代表代码行覆盖率。
+测试脚本检查真实文件与文档模型，并运行 WebKit PDF 导出、原生设置面板、三种显示模式、富文本回写和原生撤销/重做。v1.6 新增真实预览、各档边距、横竖版、页眉页码、PDF 实际字号和预览/保存一致性检查。默认清理测试产物；设置 `MARKDOWNSTUDIO_PDF_TEST_OUTPUT=/absolute/path` 可保留 PDF 和界面快照，首次请使用空目录。检查断言数不代表代码行覆盖率。
 
-验证记录：[v1.5.1 质量审计](docs/QUALITY_AUDIT.md) · [v1.5 阅读模式与导出](docs/READING_AND_PDF_FIXES.md) · [v1.4 文件打开修复](docs/FILE_OPENING_FIXES.md)。
+验证记录：[v1.6 PDF 排版与预览](docs/PDF_LAYOUT_AND_PREVIEW.md) · [v1.5.1 质量审计](docs/QUALITY_AUDIT.md) · [v1.5 阅读模式与导出](docs/READING_AND_PDF_FIXES.md) · [v1.4 文件打开修复](docs/FILE_OPENING_FIXES.md)。
 
 ## 已知限制
 

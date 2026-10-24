@@ -7,6 +7,7 @@ const source = fs.readFileSync(path.join(root, 'Sources/MarkdownStudioApp.swift'
 const info = fs.readFileSync(path.join(root, 'Info.plist'), 'utf8');
 const exporter = fs.readFileSync(path.join(root, 'Sources/PDFExporter.swift'), 'utf8');
 const runtime = fs.readFileSync(path.join(root, 'Sources/Resources/editor-runtime.js'), 'utf8');
+const pdfOptions = fs.readFileSync(path.join(root, 'Sources/PDFExportOptions.swift'), 'utf8');
 const { marked } = require(path.join(root, 'Sources/Resources/marked.min.js'));
 const katex = require(path.join(root, 'Sources/Resources/katex.min.js'));
 
@@ -35,8 +36,8 @@ for (const requirement of [
   'if displayMode.showsPreview',
   'displayMode == .split ? editorScrollProgress : nil',
   'panel.beginSheetModal(for: window)',
-  'print-color-adjust: exact'
-]) expect(source.includes(requirement), `Missing source requirement: ${requirement}`);
+  'print-color-adjust:exact'
+]) expect((source + pdfOptions).includes(requirement), `Missing source requirement: ${requirement}`);
 for (const requirement of ["content.contentEditable = 'true'", 'markdownChanged', 'katex.renderToString', 'sanitizeHTML', 'renderedToMarkdown']) {
   expect(runtime.includes(requirement), `Missing renderer requirement: ${requirement}`);
 }

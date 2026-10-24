@@ -1,16 +1,29 @@
 import AppKit
 import CoreGraphics
+import CoreText
 import PDFKit
 import WebKit
 
 /// A4 in PDF points; WebKit layout uses CSS pixels at 96 dpi.
 enum PDFPageLayout {
-    static let paperSize = CGSize(width: 595.28, height: 841.89)
-    static let horizontalMargin: CGFloat = 42
-    static let verticalMargin: CGFloat = 48
     static let scale: CGFloat = 72.0 / 96.0
-    static let contentWidth = (paperSize.width - horizontalMargin * 2) / scale
-    static let contentHeight = (paperSize.height - verticalMargin * 2) / scale
+    struct Geometry {
+        let paperSize: CGSize
+        let horizontalMargin: CGFloat
+        let topMargin: CGFloat
+        let bottomMargin: CGFloat
+        var contentWidth: CGFloat { (paperSize.width - horizontalMargin * 2) / PDFPageLayout.scale }
+        var contentHeight: CGFloat { (paperSize.height - topMargin - bottomMargin) / PDFPageLayout.scale }
+        init(options: PDFExportOptions) {
+            let portrait = options.paperSize.points
+            paperSize = options.orientation == .portrait ? portrait : CGSize(width: portrait.height, height: portrait.width)
+            horizontalMargin = options.horizontalMargin.points
+            topMargin = options.topMargin.points
+            bottomMargin = options.bottomMargin.points
+        }
+    }
+    static var contentWidth: CGFloat { Geometry(options: .default).contentWidth }
+    static var contentHeight: CGFloat { Geometry(options: .default).contentHeight }
 
     struct ProtectedRange: Codable {
         let start: Double
@@ -24,16 +37,16 @@ enum PDFPageLayout {
 
     /// Contiguous slices cover every pixel once. Prefer paragraph/row boundaries;
     /// unusually tall blocks fall back to individual text-line boundaries.
-    static func slices(for measurement: Measurement) throws -> [CGRect] {
+    static func slices(for measurement: Measurement, layout: Geometry = Geometry(options: .default)) throws -> [CGRect] {
         guard measurement.height.isFinite, measurement.height >= 0,
               measurement.ranges.allSatisfy({ $0.start.isFinite && $0.end.isFinite && $0.end >= $0.start }) else {
             throw PDFExporter.PDFExportError.invalidLayout
         }
-        guard measurement.height <= Double(contentHeight) * 1000 else {
+        guard measurement.height <= Double(layout.contentHeight) * 1000 else {
             throw PDFExporter.PDFExportError.documentTooLarge
         }
         let height = max(1, measurement.height)
-        let pageHeight = Double(contentHeight)
+        let pageHeight = Double(layout.contentHeight)
         let ranges = measurement.ranges.filter { $0.end - $0.start < pageHeight && $0.end > $0.start }
         var start = 0.0
         var pages: [CGRect] = []
@@ -47,7 +60,7 @@ enum PDFPageLayout {
                 }
             }
             guard end > start else { throw PDFExporter.PDFExportError.invalidLayout }
-            pages.append(CGRect(x: 0, y: start, width: contentWidth, height: end - start))
+            pages.append(CGRect(x: 0, y: start, width: layout.contentWidth, height: end - start))
             start = end
         }
         return pages
@@ -82,11 +95,23 @@ enum PDFExporter {
 
     @discardableResult
     static func export(markdown: String, title: String, baseURL: URL?, options: PDFExportOptions, to destination: URL,
-                       timeout: TimeInterval = 60, progress: @escaping @MainActor (Double) -> Void = { _ in },
+                       timeout: TimeInterval = 60, preparedData: Data? = nil, progress: @escaping @MainActor (Double) -> Void = { _ in },
                        completion: @escaping @MainActor (Result<Void, Error>) -> Void) -> ExportTask {
-        let job = ExportJob(title: title, options: options, destination: destination, progress: progress, completion: completion)
+        let job = ExportJob(title: title, options: options, destination: destination, preparedData: preparedData, progress: progress) { result in completion(result.map { _ in () }) }
         jobs[job.id] = job
-        // Always complete asynchronously, including validation errors and cancellation.
+        // Start and validation complete asynchronously; explicit cancellation
+        // finishes immediately so callers can discard obsolete previews safely.
+        DispatchQueue.main.async { job.start(markdown: markdown, baseURL: baseURL, timeout: timeout) }
+        return ExportTask(id: job.id)
+    }
+
+    /// Preview uses exactly the same pagination and PDF composition as export,
+    /// without creating temporary files or requesting a save destination.
+    @discardableResult
+    static func render(markdown: String, title: String, baseURL: URL?, options: PDFExportOptions,
+                       timeout: TimeInterval = 60, completion: @escaping @MainActor (Result<Data, Error>) -> Void) -> ExportTask {
+        let job = ExportJob(title: title, options: options, destination: nil, preparedData: nil, progress: { _ in }, completion: completion)
+        jobs[job.id] = job
         DispatchQueue.main.async { job.start(markdown: markdown, baseURL: baseURL, timeout: timeout) }
         return ExportTask(id: job.id)
     }
@@ -95,36 +120,47 @@ enum PDFExporter {
         let id = UUID()
         let title: String
         let options: PDFExportOptions
-        let destination: URL
+        let destination: URL?
+        let preparedData: Data?
+        let layout: PDFPageLayout.Geometry
         let webView: WKWebView
         let progress: @MainActor (Double) -> Void
-        let completion: @MainActor (Result<Void, Error>) -> Void
+        let completion: @MainActor (Result<Data, Error>) -> Void
         private var renderTask: Task<Void, Never>?
         private var timeoutTask: Task<Void, Never>?
         private var started = false
         private var finished = false
         private var scoped = false
 
-        init(title: String, options: PDFExportOptions, destination: URL, progress: @escaping @MainActor (Double) -> Void,
-             completion: @escaping @MainActor (Result<Void, Error>) -> Void) {
+        init(title: String, options: PDFExportOptions, destination: URL?, preparedData: Data?, progress: @escaping @MainActor (Double) -> Void,
+             completion: @escaping @MainActor (Result<Data, Error>) -> Void) {
             self.title = title
             self.options = options
             self.destination = destination
+            self.preparedData = preparedData
+            layout = PDFPageLayout.Geometry(options: options)
             self.progress = progress
             self.completion = completion
             let configuration = WKWebViewConfiguration()
             configuration.websiteDataStore = .nonPersistent()
-            webView = WKWebView(frame: CGRect(x: 0, y: 0, width: PDFPageLayout.contentWidth, height: PDFPageLayout.contentHeight), configuration: configuration)
+            webView = WKWebView(frame: CGRect(x: 0, y: 0, width: layout.contentWidth, height: layout.contentHeight), configuration: configuration)
             webView.appearance = NSAppearance(named: .aqua)
         }
 
         func start(markdown: String, baseURL: URL?, timeout: TimeInterval) {
             guard !finished else { return }
-            guard destination.isFileURL, destination.pathExtension.lowercased() == "pdf" else {
-                finish(.failure(PDFExportError.invalidDestination))
+            if let destination {
+                guard destination.isFileURL, destination.pathExtension.lowercased() == "pdf" else {
+                    finish(.failure(PDFExportError.invalidDestination))
+                    return
+                }
+                scoped = destination.startAccessingSecurityScopedResource()
+            }
+            if let preparedData {
+                do { try write(preparedData); progress(1); finish(.success(preparedData)) }
+                catch { finish(.failure(error)) }
                 return
             }
-            scoped = destination.startAccessingSecurityScopedResource()
             let safeTimeout = timeout.isFinite ? max(0.001, min(120, timeout)) : 60
             timeoutTask = Task { @MainActor [weak self] in
                 do { try await Task.sleep(for: .seconds(safeTimeout)) }
@@ -158,16 +194,16 @@ enum PDFExporter {
             try checkActive()
             guard let json = value as? String, let jsonData = json.data(using: .utf8) else { throw PDFExportError.invalidLayout }
             let measurement = try JSONDecoder().decode(PDFPageLayout.Measurement.self, from: jsonData)
-            let slices = try PDFPageLayout.slices(for: measurement)
+            let slices = try PDFPageLayout.slices(for: measurement, layout: layout)
             // Explicit capture rectangles must be inside the web view's full bounds,
             // not just its initial screen-sized viewport.
-            webView.setFrameSize(CGSize(width: PDFPageLayout.contentWidth, height: max(PDFPageLayout.contentHeight, measurement.height + 1)))
+            webView.setFrameSize(CGSize(width: layout.contentWidth, height: max(layout.contentHeight, measurement.height + 1)))
             _ = try await webView.evaluateJavaScript("document.body.offsetHeight")
             try checkActive()
             progress(0.15)
 
             let output = NSMutableData()
-            var paper = CGRect(origin: .zero, size: PDFPageLayout.paperSize)
+            var paper = CGRect(origin: .zero, size: layout.paperSize)
             guard let consumer = CGDataConsumer(data: output),
                   let context = CGContext(consumer: consumer, mediaBox: &paper, [kCGPDFContextTitle: title, kCGPDFContextCreator: "Markdown Studio"] as CFDictionary) else {
                 throw PDFExportError.couldNotCreateFile
@@ -187,9 +223,9 @@ enum PDFExporter {
                 context.beginPDFPage(nil)
                 context.setFillColor(options.style.pageBackground)
                 context.fill(paper)
-                let target = CGRect(x: PDFPageLayout.horizontalMargin,
-                                    y: paper.height - PDFPageLayout.verticalMargin - slice.height * PDFPageLayout.scale,
-                                    width: PDFPageLayout.contentWidth * PDFPageLayout.scale, height: slice.height * PDFPageLayout.scale)
+                let target = CGRect(x: layout.horizontalMargin,
+                                    y: paper.height - layout.topMargin - slice.height * PDFPageLayout.scale,
+                                    width: layout.contentWidth * PDFPageLayout.scale, height: slice.height * PDFPageLayout.scale)
                 let transform = page.getDrawingTransform(.mediaBox, rect: target, rotate: 0, preserveAspectRatio: true)
                 context.saveGState()
                 context.clip(to: target)
@@ -204,6 +240,7 @@ enum PDFExporter {
                         }
                     }
                 }
+                drawDecorations(in: context, page: index + 1, count: slices.count)
                 context.endPDFPage()
                 progress(0.15 + 0.8 * Double(index + 1) / Double(slices.count))
             }
@@ -212,19 +249,53 @@ enum PDFExporter {
             try checkActive()
             guard let verified = PDFDocument(data: output as Data), verified.pageCount == slices.count else { throw PDFExportError.couldNotCreateFile }
             // Failed rendering or cancellation never touches an existing PDF.
-            try (output as Data).write(to: destination, options: .atomic)
+            try write(output as Data)
             progress(1)
-            finish(.success(()))
+            finish(.success(output as Data))
         }
 
-        func finish(_ result: Result<Void, Error>) {
+        private func write(_ data: Data) throws {
+            guard let pdf = PDFDocument(data: data), pdf.pageCount > 0, pdf.pageCount <= 1000 else { throw PDFExportError.couldNotCreateFile }
+            if let destination { try data.write(to: destination, options: .atomic) }
+        }
+
+        private func drawDecorations(in context: CGContext, page: Int, count: Int) {
+            let size = options.decorationSize.points
+            let font = options.style.isSerif ? (NSFont(name: "Songti SC", size: size) ?? .systemFont(ofSize: size)) : .systemFont(ofSize: size)
+            let color = options.style.isDark ? NSColor(calibratedWhite: 0.86, alpha: 1) : NSColor(calibratedWhite: 0.33, alpha: 1)
+            let attributes: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: color]
+            func draw(_ text: String, centerY: CGFloat, centered: Bool) {
+                let line = CTLineCreateWithAttributedString(NSAttributedString(string: text, attributes: attributes))
+                let ellipsis = CTLineCreateWithAttributedString(NSAttributedString(string: "…", attributes: attributes))
+                let width = layout.contentWidth * PDFPageLayout.scale
+                let fitted = CTLineCreateTruncatedLine(line, Double(width), .end, ellipsis) ?? line
+                var ascent: CGFloat = 0, descent: CGFloat = 0
+                let measuredWidth = CGFloat(CTLineGetTypographicBounds(fitted, &ascent, &descent, nil))
+                context.saveGState()
+                context.textMatrix = .identity
+                context.textPosition = CGPoint(x: layout.horizontalMargin + (centered ? max(0, (width - measuredWidth) / 2) : 0), y: centerY - (ascent - descent) / 2)
+                CTLineDraw(fitted, context)
+                context.restoreGState()
+            }
+            // Keep small-margin decorations away from the printer's edge zone.
+            let edgeDistance = 18 + size / 2
+            if options.showsHeader { draw(documentTitleForHeader, centerY: layout.paperSize.height - max(layout.topMargin / 2, edgeDistance), centered: false) }
+            if options.showsPageNumbers { draw("第 \(page) / \(count) 页", centerY: max(layout.bottomMargin / 2, edgeDistance), centered: true) }
+        }
+
+        private var documentTitleForHeader: String { title.components(separatedBy: .newlines).joined(separator: " ") }
+
+        func finish(_ result: Result<Data, Error>) {
             guard !finished else { return }
             finished = true
             renderTask?.cancel()
             timeoutTask?.cancel()
             webView.stopLoading()
             webView.navigationDelegate = nil
-            if scoped { destination.stopAccessingSecurityScopedResource() }
+            // An image/font promise may otherwise retain an obsolete preview's
+            // JS context after cancellation. Navigating away resolves that wait.
+            if case .failure = result, started { webView.loadHTMLString("", baseURL: nil) }
+            if scoped { destination?.stopAccessingSecurityScopedResource() }
             jobs.removeValue(forKey: id)
             completion(result)
         }
@@ -279,13 +350,7 @@ enum PDFExporter {
 
 extension PDFExportStyle {
     var pageBackground: CGColor {
-        let components: [CGFloat]
-        switch self {
-        case .clean: components = [1, 1, 1, 1]
-        case .paper: components = [252.0/255, 246.0/255, 233.0/255, 1]
-        case .book: components = [1, 253.0/255, 248.0/255, 1]
-        case .night: components = [29.0/255, 35.0/255, 45.0/255, 1]
-        }
+        let components: [CGFloat] = isDark ? [29.0/255, 35.0/255, 45.0/255, 1] : [1, 1, 1, 1]
         return CGColor(colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!, components: components)!
     }
 }

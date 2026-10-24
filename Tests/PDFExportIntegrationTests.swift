@@ -38,14 +38,16 @@ enum PDFExportIntegrationTests {
             while !completed(), Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.01)) }
             try check(completed(), "Asynchronous export completed before deadline")
         }
-        func run(_ markdown: String, name: String, style: PDFExportStyle = .clean, size: CGFloat = 16,
-                 destination: URL? = nil, timeout: TimeInterval = 30, cancel: Bool = false) throws -> Result<Void, Error> {
+        func run(_ markdown: String, name: String, style: PDFExportStyle = .lightSans, size: CGFloat = 16,
+                 destination: URL? = nil, timeout: TimeInterval = 30, cancel: Bool = false,
+                 customOptions: PDFExportOptions? = nil, preparedData: Data? = nil) throws -> Result<Void, Error> {
             var result: Result<Void, Error>?
             var completions = 0
             var progress: [Double] = []
             let task = PDFExporter.export(markdown: markdown, title: name, baseURL: directory,
-                                          options: PDFExportOptions(style: style, fontSize: size),
+                                          options: customOptions ?? PDFExportOptions(style: style, fontSize: size),
                                           to: destination ?? directory.appendingPathComponent(name + ".pdf"), timeout: timeout,
+                                          preparedData: preparedData,
                                           progress: { progress.append($0) }) {
                 result = $0
                 completions += 1
@@ -68,20 +70,26 @@ enum PDFExportIntegrationTests {
             return pdf
         }
         func text(_ pdf: PDFDocument) -> String {
-            (pdf.string ?? "").precomposedStringWithCompatibilityMapping.filter { !$0.isWhitespace }
+            (pdf.string ?? "").precomposedStringWithCompatibilityMapping.filter { !$0.isWhitespace }.replacingOccurrences(of: "第[0-9]+/[0-9]+页", with: "", options: .regularExpression)
         }
+        var familyNames: [PDFExportStyle: String] = [:]
 
         for style in PDFExportStyle.allCases {
             let name = "style-\(style.rawValue)"
             let markdown = "# 中文 PDF 验证\n\nBEGIN-\(style.rawValue)\n\n| 项目 | 内容 |\n| --- | --- |\n| 表格 | **粗体** ~~删除线~~ |\n| 公式 | $E=mc^2$ |\n\n[可点击链接](https://example.com)\n\nEND-\(style.rawValue)\n"
-            try run(markdown, name: name, style: style, size: style == .night ? 26 : 16).get()
+            try run(markdown, name: name, style: style, size: style == .darkSans ? 26 : 16).get()
             let pdf = try document(name)
             try check(text(pdf).contains("BEGIN-\(style.rawValue)") && text(pdf).contains("END-\(style.rawValue)"), "Both markers for \(style.rawValue)")
             try check(pdf.page(at: 0)!.annotations.contains { $0.url?.host == "example.com" }, "Preserve clickable links")
+            if let attributed = pdf.page(at: 0)!.attributedString {
+                let range = (attributed.string as NSString).range(of: "BEGIN-")
+                if range.location != NSNotFound, let font = attributed.attribute(.font, at: range.location, effectiveRange: nil) as? NSFont { familyNames[style] = font.fontName }
+            }
             print("Exported style:", style.rawValue, "pages:", pdf.pageCount)
         }
+        try check(familyNames[.lightSerif] != nil && familyNames[.lightSerif] != familyNames[.lightSans] && familyNames[.darkSerif] != familyNames[.darkSans], "The four presets use genuinely different serif/sans fonts in the PDF")
         let long = try String(contentsOfFile: "Tests/Fixtures/pdf-long.md", encoding: .utf8)
-        try run(long, name: "long", style: .book, size: 22).get()
+        try run(long, name: "long", style: .lightSerif, size: 22).get()
         let longPDF = try document("long")
         let longText = text(longPDF)
         try check(longPDF.pageCount > 1, "Long document is paginated")
@@ -112,6 +120,63 @@ enum PDFExportIntegrationTests {
         try check(wideText.contains("32") && wideText.filter { $0 == "x" }.count >= 32, "Wide equation retains all terms and final subscript")
         try check(wideText.components(separatedBy: "WORD-BEGIN-").count == 2, "Pagination does not duplicate paragraph start")
 
+        var printOptions = PDFExportOptions(style: .lightSerif, fontSize: 14, titleFontSize: 46, topMargin: .large, bottomMargin: .small, horizontalMargin: .large, paperSize: .letter, orientation: .landscape, lineSpacing: .compact, showsHeader: true, showsPageNumbers: true, decorationSize: .large)
+        let printText = "# TITLE-FONT-CHECK\n\nBODY-FONT-CHECK\n\n" + String(repeating: "打印排版边界 paragraph content.\n\n", count: 70) + "PRINT-END"
+        try run(printText, name: "letter-landscape", customOptions: printOptions).get()
+        let printed = PDFDocument(url: directory.appendingPathComponent("letter-landscape.pdf"))!
+        let geometry = PDFPageLayout.Geometry(options: printOptions)
+        try check(printed.pageCount > 1, "Landscape print fixture spans multiple pages")
+        for index in 0..<printed.pageCount {
+            let page = printed.page(at: index)!
+            try check(abs(page.bounds(for: .mediaBox).width - 792) < 0.1 && abs(page.bounds(for: .mediaBox).height - 612) < 0.1, "Letter landscape media box")
+            let pageText = (page.string ?? "").filter { !$0.isWhitespace }
+            try check(pageText.contains("letter-landscape") && pageText.contains("第\(index + 1)/\(printed.pageCount)页"), "Document header and page / total footer on every page")
+            let headerRange = ((page.string ?? "") as NSString).range(of: "letter-landscape")
+            try check(headerRange.location != NSNotFound, "Header's selectable character index exists")
+            let headerBounds = page.characterBounds(at: headerRange.location)
+            try check(headerBounds.minY >= geometry.paperSize.height - geometry.topMargin && headerBounds.maxY <= geometry.paperSize.height - 17, "Header is outside body, away from the paper edge")
+        }
+        if let page = printed.page(at: 0), let attributed = page.attributedString {
+            for (marker, expected) in [("TITLE-FONT-CHECK", 46.0), ("BODY-FONT-CHECK", 14.0)] {
+                let range = (attributed.string as NSString).range(of: marker)
+                try check(range.location != NSNotFound, "Font marker is selectable text")
+                let font = attributed.attribute(.font, at: range.location, effectiveRange: nil) as? NSFont
+                try check(font != nil && abs(Double(font!.pointSize) - expected) < 0.5, "Actual PDF point size for \(marker)")
+                let bounds = page.characterBounds(at: range.location)
+                try check(bounds.minX >= geometry.horizontalMargin - 1 && bounds.maxY <= geometry.paperSize.height - geometry.topMargin + 1, "Body and title stay inside custom printable margins")
+            }
+        } else { throw NSError(domain: "PDFIntegrationTests", code: 12) }
+        printOptions.showsHeader = false
+        printOptions.showsPageNumbers = false
+        try run("# Decorations disabled\n\nNO-DECORATION-END", name: "no-decorations", customOptions: printOptions).get()
+        let plain = PDFDocument(url: directory.appendingPathComponent("no-decorations.pdf"))!
+        try check(!text(plain).contains("no-decorations") && !text(plain).contains("第1/1页"), "Header and footer can be disabled independently of margins")
+        for (paper, orientation) in [(PDFPaperSize.a4, PDFOrientation.landscape), (.letter, .portrait)] {
+            let settings = PDFExportOptions(paperSize: paper, orientation: orientation)
+            let name = "paper-\(paper.rawValue)-\(orientation.rawValue)"
+            try run("# Paper check\n\nPAPER-END", name: name, customOptions: settings).get()
+            let pdf = PDFDocument(url: directory.appendingPathComponent(name + ".pdf"))!
+            let expected = PDFPageLayout.Geometry(options: settings).paperSize
+            try check(pdf.page(at: 0)!.bounds(for: .mediaBox).size == expected && text(pdf).contains("PAPER-END"), "Actual PDF bounds for \(paper.rawValue) \(orientation.rawValue)")
+        }
+
+        var previewResult: Result<Data, Error>?
+        PDFExporter.render(markdown: printText, title: "PREVIEW-EXACT", baseURL: directory, options: printOptions) { previewResult = $0 }
+        try wait { previewResult != nil }
+        let exactPreview = try previewResult!.get()
+        try run("MUST-NOT-RERENDER", name: "exact-preview", preparedData: exactPreview).get()
+        try check(try Data(contentsOf: directory.appendingPathComponent("exact-preview.pdf")) == exactPreview, "Export writes precisely the bytes shown in preview, with no rerender")
+        try check(PDFExporter.activeJobCount == 0, "In-memory preview releases its WebKit job")
+
+        let spacingText = String(repeating: "打印边距与行距验证，paragraph content with multiple words and lines.\n\n", count: 130) + "MARGIN-END"
+        let narrow = PDFExportOptions(fontSize: 14, topMargin: .small, bottomMargin: .small, horizontalMargin: .small)
+        let generous = PDFExportOptions(fontSize: 14, topMargin: .large, bottomMargin: .large, horizontalMargin: .large, lineSpacing: .relaxed)
+        try run(spacingText, name: "small-margins", customOptions: narrow).get()
+        try run(spacingText, name: "large-margins", customOptions: generous).get()
+        let smallPDF = try document("small-margins"), largePDF = try document("large-margins")
+        try check(largePDF.pageCount > smallPDF.pageCount, "Larger margins and spacing materially change actual pagination")
+        try check(text(smallPDF).contains("MARGIN-END") && text(largePDF).contains("MARGIN-END"), "Both margin presets retain the document end")
+
         try Data(contentsOf: URL(fileURLWithPath: "Tests/Fixtures/local-image.svg")).write(to: directory.appendingPathComponent("本地 图片.svg"), options: .atomic)
         try run("# 本地图片\n\n![LOCAL-IMAGE-UNAVAILABLE](<本地 图片.svg>)\n\nLOCAL-IMAGE-END", name: "local-image").get()
         let imageText = text(try document("local-image"))
@@ -137,17 +202,21 @@ enum PDFExportIntegrationTests {
         let badExtension = try run("must not overwrite", name: "invalid", destination: directory.appendingPathComponent("source.md"))
         if case .failure(PDFExporter.PDFExportError.invalidDestination) = badExtension { checks += 1 }
         else { throw NSError(domain: "PDFIntegrationTests", code: 6) }
+        let invalidPreview = try run("must not overwrite", name: "invalid-preview", destination: protected, preparedData: Data("not a PDF".utf8))
+        if case .failure(PDFExporter.PDFExportError.couldNotCreateFile) = invalidPreview { checks += 1 }
+        else { throw NSError(domain: "PDFIntegrationTests", code: 13) }
+        try check(try Data(contentsOf: protected) == Data("ORIGINAL".utf8), "Invalid preview data cannot damage an existing file")
 
         let model = MarkdownDocument()
         model.text = "# Document export\n\nMODEL-END"
         let modelOutput = directory.appendingPathComponent("model.pdf")
-        model.beginPDFExport(to: modelOutput, options: .init(style: .clean, fontSize: 16))
+        model.beginPDFExport(to: modelOutput, options: .init(style: .lightSans, fontSize: 16))
         try check(model.isExportingPDF, "Document enters exporting state")
         try wait { !model.isExportingPDF }
         try check(model.errorMessage == nil && model.exportProgress == nil, "Successful document export clears progress without error")
         try check(PDFDocument(url: modelOutput)?.string?.contains("MODEL-END") == true, "Document writes actual PDF")
         try check(model.exportedPDFURL == modelOutput, "Expose the generated file for the Open PDF action")
-        model.beginPDFExport(to: protected, options: .init(style: .clean, fontSize: 16))
+        model.beginPDFExport(to: protected, options: .init(style: .lightSans, fontSize: 16))
         model.cancelPDFExport()
         try check(!model.isExportingPDF && model.errorMessage == nil && model.exportedPDFURL == nil && model.notice == "已取消 PDF 导出", "Cancellation resets document state without an error alert")
 
@@ -187,19 +256,83 @@ enum PDFExportIntegrationTests {
         }
         slider.doubleValue = 22
         if let action = slider.action { NSApp.sendAction(action, to: slider.target, from: slider) }
-        popup.selectItem(at: 2)
-        try check(optionsSheet.options.fontSize == 22 && optionsSheet.options.style == .book, "Native slider and style popup update actual export options")
+        popup.selectItem(at: 1)
+        if let action = popup.action { NSApp.sendAction(action, to: popup.target, from: popup) }
+        try check(optionsSheet.options.fontSize == 22 && optionsSheet.options.style == .lightSerif, "Native slider and style popup update actual export options")
         try check(!optionsSheet.isMovableByWindowBackground, "Controls are not a draggable window background")
+        try wait { optionsSheet.isPreviewReady }
+        func control<T: NSView>(_ identifier: String, as type: T.Type, in root: NSView) throws -> T {
+            guard let found = descendants(root).first(where: { $0.identifier?.rawValue == identifier }) as? T else {
+                throw NSError(domain: "PDFIntegrationTests", code: 14, userInfo: [NSLocalizedDescriptionKey: "Missing control: \(identifier)"])
+            }
+            return found
+        }
+        func select(_ identifier: String, index: Int) throws {
+            let popup = try control(identifier, as: NSPopUpButton.self, in: root)
+            popup.selectItem(at: index)
+            if let action = popup.action { NSApp.sendAction(action, to: popup.target, from: popup) }
+        }
+        let oldPreview = optionsSheet.previewData
+        try select("pdf.topMargin", index: 2)
+        try select("pdf.bottomMargin", index: 0)
+        try select("pdf.horizontalMargin", index: 2)
+        try select("pdf.paperSize", index: 1)
+        try select("pdf.orientation", index: 1)
+        try select("pdf.decorationSize", index: 2)
+        let titleSlider = try control("pdf.titleFontSize", as: NSSlider.self, in: root)
+        titleSlider.doubleValue = 46
+        if let action = titleSlider.action { NSApp.sendAction(action, to: titleSlider.target, from: titleSlider) }
+        try check(!optionsSheet.isPreviewReady && !(try button("继续", in: optionsSheet)).isEnabled, "Changing controls immediately disables exporting a stale preview")
+        for value in [12.0, 18.0, 22.0] {
+            slider.doubleValue = value
+            if let action = slider.action { NSApp.sendAction(action, to: slider.target, from: slider) }
+        }
+        try wait { optionsSheet.isPreviewReady }
+        try check(optionsSheet.options.titleFontSize == 46 && optionsSheet.options.topMargin == .large && optionsSheet.options.bottomMargin == .small && optionsSheet.options.decorationSize == .large, "All native typography/margin controls feed real settings")
+        let previewPDF = optionsSheet.previewView.document!
+        try check(previewPDF.pageCount > 0 && previewPDF.page(at: 0)!.bounds(for: .mediaBox).size == CGSize(width: 792, height: 612), "Native PDFView displays actual Letter landscape PDF")
+        try check(oldPreview != optionsSheet.previewData && optionsSheet.options.fontSize == 22, "Rapid setting changes only accept the latest preview")
+        optionsSheet.contentView?.layoutSubtreeIfNeeded()
+        let leftScroll = descendants(root).compactMap { $0 as? NSScrollView }.first(where: { $0.documentView is PDFExportOptionsView })!
+        try check(leftScroll.documentView!.frame.width <= leftScroll.contentView.bounds.width + 1, "Settings are not clipped horizontally inside scroll container")
+        for appearance in [NSAppearance.Name.aqua, .darkAqua] {
+            optionsSheet.appearance = NSAppearance(named: appearance)
+            root.layoutSubtreeIfNeeded()
+            root.displayIfNeeded()
+            RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+            if let bitmap = root.bitmapImageRepForCachingDisplay(in: root.bounds) {
+                root.effectiveAppearance.performAsCurrentDrawingAppearance { root.cacheDisplay(in: root.bounds, to: bitmap) }
+                try bitmap.representation(using: .png, properties: [:])?.write(to: directory.appendingPathComponent("pdf-settings-\(appearance.rawValue).png"))
+            }
+            try root.dataWithPDF(inside: root.bounds).write(to: directory.appendingPathComponent("pdf-settings-\(appearance.rawValue).pdf"))
+        }
+        optionsSheet.setContentSize(NSSize(width: 800, height: 500))
+        root.layoutSubtreeIfNeeded()
+        try check(leftScroll.documentView!.frame.width <= leftScroll.contentView.bounds.width + 1 && (try button("继续", in: optionsSheet)).frame.width >= 80, "Small window keeps controls usable with scrolling settings")
         try button("继续", in: optionsSheet).performClick(nil)
         try wait { window.attachedSheet is NSSavePanel }
         let remembered = PDFExportOptions.load(from: defaults)
-        try check(remembered.style == .book && remembered.fontSize == 22, "Native confirmation persists selected options")
+        try check(remembered.style == .lightSerif && remembered.fontSize == 22, "Native confirmation persists selected options")
+        try check(remembered.paperSize == .letter && remembered.orientation == .landscape && remembered.titleFontSize == 46, "Confirmation persists new print settings")
         (window.attachedSheet as! NSSavePanel).cancel(nil)
         try wait { !flow.isExportingPDF }
         try check(flow.errorMessage == nil, "Cancelling save panel resets state without error")
 
         flow.exportPDF()
         try wait { window.attachedSheet is PDFExportOptionsPanel }
+        let resetSheet = window.attachedSheet as! PDFExportOptionsPanel
+        try button("恢复默认设置", in: resetSheet).performClick(nil)
+        try check(resetSheet.options == .default, "Restore defaults resets every option")
+        try wait { resetSheet.isPreviewReady }
+        try button("取消", in: resetSheet).performClick(nil)
+        try wait { !flow.isExportingPDF }
+        try check(PDFExportOptions.load(from: defaults) == remembered, "Cancel after resetting does not change saved preferences")
+        try check(PDFExporter.activeJobCount == 0, "Cancel releases all preview jobs")
+
+        flow.exportPDF()
+        try wait { window.attachedSheet is PDFExportOptionsPanel }
+        try wait { (window.attachedSheet as? PDFExportOptionsPanel)?.isPreviewReady == true }
+        let acceptedPreview = (window.attachedSheet as! PDFExportOptionsPanel).previewData!
         try button("继续", in: window.attachedSheet!).performClick(nil)
         try wait { window.attachedSheet is NSSavePanel }
         let savePanel = window.attachedSheet as! NSSavePanel
@@ -209,10 +342,11 @@ enum PDFExportIntegrationTests {
         // production export method separately instead of calling that stub.
         savePanel.cancel(nil)
         try wait { !flow.isExportingPDF }
-        flow.beginPDFExport(to: directory.appendingPathComponent("native-flow.pdf"), options: remembered)
+        flow.beginPDFExport(to: directory.appendingPathComponent("native-flow.pdf"), options: remembered, preparedData: acceptedPreview)
         try wait { !flow.isExportingPDF }
         try check(flow.errorMessage == nil, "Export following options/save cancellation remains usable")
         try check(PDFDocument(url: directory.appendingPathComponent("native-flow.pdf"))?.string?.contains("NATIVE-FLOW-END") == true, "Destination callback method produces a real PDF")
+        try check(try Data(contentsOf: directory.appendingPathComponent("native-flow.pdf")) == acceptedPreview, "Document destination callback saves exactly the native preview")
 
         let workspace = MarkdownWorkspace()
         let hosting = NSHostingView(rootView: AnyView(EmptyView()))

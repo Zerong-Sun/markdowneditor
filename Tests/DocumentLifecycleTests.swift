@@ -94,12 +94,39 @@ enum DocumentLifecycleTests {
         let defaults = UserDefaults(suiteName: defaultsName)!
         defer { defaults.removePersistentDomain(forName: defaultsName) }
         try check(PDFExportOptions.load(from: defaults).normalizedFontSize == 16, "Default PDF font size")
-        PDFExportOptions(style: .night, fontSize: 22).save(to: defaults)
+        PDFExportOptions(style: .darkSans, fontSize: 22).save(to: defaults)
         let remembered = PDFExportOptions.load(from: defaults)
-        try check(remembered.style == .night && remembered.fontSize == 22, "Remember PDF options")
-        try check(PDFExportOptions(style: .clean, fontSize: .nan).normalizedFontSize == 16, "Reject non-finite font size")
-        try check(PDFExportOptions(style: .clean, fontSize: 100).normalizedFontSize == 26, "Clamp large font size")
-        try check(PDFExportOptions(style: .clean, fontSize: 0).normalizedFontSize == 11, "Clamp small font size")
+        try check(remembered.style == .darkSans && remembered.fontSize == 22, "Remember PDF options")
+        try check(PDFExportOptions(style: .lightSans, fontSize: .nan).normalizedFontSize == 16, "Reject non-finite font size")
+        try check(PDFExportOptions(style: .lightSans, fontSize: 100).normalizedFontSize == 32, "Clamp large font size")
+        try check(PDFExportOptions(style: .lightSans, fontSize: 0).normalizedFontSize == 8, "Clamp small font size")
+        defaults.removeObject(forKey: "pdf.titleFontSize")
+        defaults.set("book", forKey: "pdf.style")
+        try check(PDFExportOptions.load(from: defaults).titleFontSize == 44 && PDFExportOptions.load(from: defaults).style == .lightSerif, "Legacy body size preserves its two-times H1 size during migration")
+        try check(PDFExportStyle.allCases.count == 4 && Set(PDFExportStyle.allCases.map { "\($0.isDark)-\($0.isSerif)" }).count == 4, "Four presets cover every light/dark and serif/sans combination")
+        try check(PDFExportStyle.migrated("clean") == .lightSans && PDFExportStyle.migrated("book") == .lightSerif && PDFExportStyle.migrated("night") == .darkSans && PDFExportStyle.migrated("paper") == .lightSerif, "Migrate the previous four style preferences")
+        let customized = PDFExportOptions(style: .darkSerif, fontSize: 13, titleFontSize: 48, topMargin: .large, bottomMargin: .small, horizontalMargin: .large, paperSize: .letter, orientation: .landscape, lineSpacing: .relaxed, showsHeader: true, showsPageNumbers: false, decorationSize: .large)
+        customized.save(to: defaults)
+        try check(PDFExportOptions.load(from: defaults) == customized, "Remember every print and typography setting")
+        try check(PDFExportOptions(titleFontSize: .nan).normalizedTitleFontSize == 32, "Non-finite title size uses default")
+        try check(PDFExportOptions(titleFontSize: 100).normalizedTitleFontSize == 72 && PDFExportOptions(titleFontSize: 0).normalizedTitleFontSize == 16, "Bound title font separately from body font")
+        try check(customized.appearance.additionalCSS.contains("font-size:48pt") && customized.appearance.additionalCSS.contains("Georgia"), "Custom title font and serif family reach export CSS")
+        defaults.set("invalid", forKey: "pdf.topMargin")
+        defaults.set("invalid", forKey: "pdf.paperSize")
+        try check(PDFExportOptions.load(from: defaults).topMargin == .medium && PDFExportOptions.load(from: defaults).paperSize == .a4, "Invalid stored options fall back safely")
+        for paper in PDFPaperSize.allCases {
+            for orientation in PDFOrientation.allCases {
+                for top in PDFMarginSize.allCases {
+                    for bottom in PDFMarginSize.allCases {
+                        let options = PDFExportOptions(topMargin: top, bottomMargin: bottom, horizontalMargin: .large, paperSize: paper, orientation: orientation)
+                        let geometry = PDFPageLayout.Geometry(options: options)
+                        try check(geometry.contentWidth > 0 && geometry.contentHeight > 0, "Positive printable area for every paper/orientation/margin combination")
+                        let pages = try PDFPageLayout.slices(for: .init(height: 2300, ranges: []), layout: geometry)
+                        try check(pages.allSatisfy { abs($0.width - geometry.contentWidth) < 0.01 } && abs(pages.last!.maxY - 2300) < 0.01, "Custom page geometry covers the whole document without gaps")
+                    }
+                }
+            }
+        }
         let plannerHeight = Double(PDFPageLayout.contentHeight)
         let plainPages = try PDFPageLayout.slices(for: .init(height: plannerHeight * 2 + 10, ranges: []))
         try check(plainPages.count == 3, "Paginate full document")
