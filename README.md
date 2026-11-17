@@ -2,9 +2,9 @@
 
 一个原生 macOS Markdown 编辑器，支持源码编辑、双栏实时预览、仅读取模式、渲染编辑和多页 PDF 导出。内置 Markdown 语法示例、GFM 解析器和 KaTeX，无需联网即可渲染本地正文与公式；网络图片仍需要网络。
 
-最新版本：**v1.6.0（build 8）**，升级 PDF 排版设置与实际预览。
+最新版本：**v1.6.1（build 9）**，修复本地图片显示。
 
-[下载 Mac 应用](https://github.com/Zerong-Sun/markdowneditor/releases/download/v1.6.0/Markdown-Studio-macOS.zip) · [版本说明](https://github.com/Zerong-Sun/markdowneditor/releases/tag/v1.6.0) · [SHA-256 校验文件](https://github.com/Zerong-Sun/markdowneditor/releases/download/v1.6.0/SHA256SUMS.txt)
+[下载 Mac 应用](https://github.com/Zerong-Sun/markdowneditor/releases/download/v1.6.1/Markdown-Studio-macOS.zip) · [版本说明](https://github.com/Zerong-Sun/markdowneditor/releases/tag/v1.6.1) · [SHA-256 校验文件](https://github.com/Zerong-Sun/markdowneditor/releases/download/v1.6.1/SHA256SUMS.txt)
 
 ## 下载与安装
 
@@ -49,6 +49,8 @@ shasum -a 256 -c SHA256SUMS.txt
 | 关闭当前文档 | `⌘W` |
 
 ## 导出 PDF
+
+本地图片请放在 Markdown 文件同一目录或子目录，例如 `![示意图](<images/流程 图.png>)`。预览、渲染编辑和 PDF 导出使用同一加载规则；目录之外的本地图片和指向外部的软链接不会由应用读取。网络图片仍须能从其原始地址访问。
 
 1. 按 `⌘P` 或点击“导出 PDF”。
 2. 左侧选择风格、正文/H1 字号、行距、纸张和方向；调整上、下、左右边距（小 12 mm / 中 20 mm / 大 28 mm）。页眉页脚字号另选 8 / 10 / 12 pt，可独立勾选文档名与页码。

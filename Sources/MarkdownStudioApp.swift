@@ -837,6 +837,48 @@ final class MarkdownSourceTextView: NSTextView {
     }
 }
 
+@MainActor
+final class MarkdownLocalImages: NSObject, WKScriptMessageHandlerWithReply {
+    private static let channel = "markdownLocalImage"
+    private var directory: URL?
+
+    static func configuration() -> WKWebViewConfiguration {
+        let config = WKWebViewConfiguration()
+        let loader = MarkdownLocalImages()
+        config.userContentController.addScriptMessageHandler(loader, contentWorld: .page, name: channel)
+        config.userContentController.addUserScript(WKUserScript(source: "window.markdownLocalImagesEnabled = true;", injectionTime: .atDocumentStart, forMainFrameOnly: true))
+        objc_setAssociatedObject(config.userContentController, &loaderKey, loader, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+        return config
+    }
+
+    static func load(_ html: String, in view: WKWebView, baseURL: URL?) {
+        view.stopLoading()
+        let handler = objc_getAssociatedObject(view.configuration.userContentController, &loaderKey) as? MarkdownLocalImages
+        handler?.directory = baseURL?.isFileURL == true ? baseURL?.standardizedFileURL.resolvingSymlinksInPath() : nil
+        view.loadHTMLString(html, baseURL: baseURL)
+    }
+
+    private static var loaderKey: UInt8 = 0
+
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage, replyHandler: @escaping @MainActor @Sendable (Any?, String?) -> Void) {
+        let types = ["png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "gif": "image/gif", "webp": "image/webp", "avif": "image/avif", "bmp": "image/bmp", "svg": "image/svg+xml"]
+        guard message.frameInfo.isMainFrame, let directory,
+              let source = message.body as? String,
+              let url = URL(string: source), url.isFileURL,
+              [nil, "", "localhost"].contains(url.host)
+        else { replyHandler(nil, "Invalid local image"); return }
+        let file = url.standardizedFileURL.resolvingSymlinksInPath()
+        guard file.pathComponents.starts(with: directory.pathComponents),
+              let mime = types[file.pathExtension.lowercased()],
+              let values = try? file.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
+              values.isRegularFile == true, let size = values.fileSize, size <= 32 * 1024 * 1024,
+              let data = try? Data(contentsOf: file), data.count == size
+        else { replyHandler(nil, "Local image unavailable"); return }
+        replyHandler("data:\(mime);base64,\(data.base64EncodedString())", nil)
+    }
+
+}
+
 struct MarkdownPreview: NSViewRepresentable {
     let markdown: String
     let baseURL: URL?
@@ -846,7 +888,7 @@ struct MarkdownPreview: NSViewRepresentable {
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     func makeNSView(context: Context) -> WKWebView {
-        let configuration = WKWebViewConfiguration()
+        let configuration = MarkdownLocalImages.configuration()
         let view = MarkdownFileDropWebView(frame: .zero, configuration: configuration)
         view.onOpenFiles = onOpenFiles
         view.registerForDraggedTypes(view.registeredDraggedTypes + [.fileURL])
@@ -865,7 +907,7 @@ struct MarkdownPreview: NSViewRepresentable {
         if context.coordinator.lastHTML != html || context.coordinator.lastBasePath != basePath {
             context.coordinator.lastHTML = html
             context.coordinator.lastBasePath = basePath
-            view.loadHTMLString(html, baseURL: baseURL)
+            MarkdownLocalImages.load(html, in: view, baseURL: baseURL)
         } else {
             context.coordinator.applyScroll(to: view)
         }
@@ -895,7 +937,7 @@ struct RenderedMarkdownEditor: NSViewRepresentable {
     func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
 
     func makeNSView(context: Context) -> WKWebView {
-        let configuration = WKWebViewConfiguration()
+        let configuration = MarkdownLocalImages.configuration()
         configuration.userContentController.add(context.coordinator, name: "markdownChanged")
         let view = MarkdownFileDropWebView(frame: .zero, configuration: configuration)
         view.onOpenFiles = onOpenFiles
@@ -920,7 +962,7 @@ struct RenderedMarkdownEditor: NSViewRepresentable {
         context.coordinator.hasLoadedDocument = true
         context.coordinator.lastMarkdown = markdown
         context.coordinator.lastBasePath = basePath
-        view.loadHTMLString(MarkdownRenderer.documentHTML(markdown: markdown, title: "渲染编辑", editable: true), baseURL: baseURL)
+        MarkdownLocalImages.load(MarkdownRenderer.documentHTML(markdown: markdown, title: "渲染编辑", editable: true), in: view, baseURL: baseURL)
     }
 
     static func dismantleNSView(_ view: WKWebView, coordinator: Coordinator) {

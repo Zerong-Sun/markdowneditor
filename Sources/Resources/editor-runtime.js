@@ -27,6 +27,9 @@ marked.use({gfm: true, breaks: false, extensions: [
   }
 ]});
 
+const localImageSources = new WeakMap();
+const localImageLoads = [];
+
 function sanitizeHTML(html) {
   const safe = new DOMParser().parseFromString(html, 'text/html');
   safe.querySelectorAll('script,style,iframe,frame,frameset,object,embed,form,button,textarea,select,option,link,meta,base,svg,math,video,audio,source,track').forEach(node => node.remove());
@@ -51,6 +54,20 @@ function sanitizeHTML(html) {
       }
     });
   });
+  if (window.markdownLocalImagesEnabled && document.baseURI.startsWith('file:')) {
+    safe.querySelectorAll('img[src]').forEach(node => {
+      const source = node.getAttribute('src');
+      try {
+        const url = new URL(source, document.baseURI);
+        if (!source || url.protocol !== 'file:') return;
+        localImageSources.set(node, source);
+        node.removeAttribute('src');
+        localImageLoads.push(window.webkit.messageHandlers.markdownLocalImage.postMessage(url.href)
+          .then(data => { node.src = data; })
+          .catch(() => {}));
+      } catch { /* Leave invalid addresses unchanged. */ }
+    });
+  }
   return safe.body;
 }
 
@@ -119,7 +136,7 @@ function inlineMarkdown(node) {
       return fence + pad + text + pad + fence;
     }
     case 'A': return `[${value}](<${(node.getAttribute('href') || '').replace(/>/g, '%3E')}>${node.title ? ` "${node.title.replace(/"/g, '&quot;')}"` : ''})`;
-    case 'IMG': return `![${escapeText(node.alt || '')}](<${(node.getAttribute('src') || '').replace(/>/g, '%3E')}>)`;
+    case 'IMG': return `![${escapeText(node.alt || '')}](<${(localImageSources.get(node) || node.getAttribute('src') || '').replace(/>/g, '%3E')}>)`;
     case 'BR': return '  \n';
     case 'INPUT': return node.checked ? '[x] ' : '[ ] ';
     case 'KBD': case 'MARK': case 'SUB': case 'SUP': return node.outerHTML;

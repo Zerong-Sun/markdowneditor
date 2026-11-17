@@ -141,7 +141,7 @@ enum PDFExporter {
             layout = PDFPageLayout.Geometry(options: options)
             self.progress = progress
             self.completion = completion
-            let configuration = WKWebViewConfiguration()
+            let configuration = MarkdownLocalImages.configuration()
             configuration.websiteDataStore = .nonPersistent()
             webView = WKWebView(frame: CGRect(x: 0, y: 0, width: layout.contentWidth, height: layout.contentHeight), configuration: configuration)
             webView.appearance = NSAppearance(named: .aqua)
@@ -169,7 +169,7 @@ enum PDFExporter {
             }
             progress(0.02)
             webView.navigationDelegate = self
-            webView.loadHTMLString(MarkdownRenderer.documentHTML(markdown: markdown, title: title, appearance: options.appearance), baseURL: baseURL)
+            MarkdownLocalImages.load(MarkdownRenderer.documentHTML(markdown: markdown, title: title, appearance: options.appearance), in: webView, baseURL: baseURL)
         }
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
@@ -308,6 +308,7 @@ enum PDFExporter {
         document.querySelectorAll('details').forEach(node => { node.open = true; });
         document.querySelectorAll('img').forEach(node => { node.loading = 'eager'; });
         await document.fonts.ready;
+        if (typeof localImageLoads !== 'undefined') await Promise.all(localImageLoads);
         await Promise.all(Array.from(document.images).map(img => img.complete ? Promise.resolve() : new Promise(resolve => {
           img.addEventListener('load', resolve, {once:true});
           img.addEventListener('error', resolve, {once:true});

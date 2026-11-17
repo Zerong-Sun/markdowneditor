@@ -36,11 +36,25 @@ enum EditorQualityIntegrationTests {
             return result
         }
         func literal(_ value: String) -> String { String(data: try! JSONEncoder().encode(value), encoding: .utf8)! }
-        func load(_ markdown: String, editable: Bool = true) throws -> WKWebView {
-            let view = WKWebView(frame: NSRect(x: 0, y: 0, width: 800, height: 600))
-            view.loadHTMLString(MarkdownRenderer.documentHTML(markdown: markdown, title: "Quality test", editable: editable), baseURL: URL(fileURLWithPath: "Tests/Fixtures", isDirectory: true).standardizedFileURL)
+        let imageDirectory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: imageDirectory, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: imageDirectory) }
+        try Data(contentsOf: URL(fileURLWithPath: "Tests/Fixtures/local-image.svg")).write(to: imageDirectory.appendingPathComponent("local-image.svg"))
+        func load(_ markdown: String, editable: Bool = true, baseURL: URL? = nil) throws -> WKWebView {
+            let view = WKWebView(frame: NSRect(x: 0, y: 0, width: 800, height: 600), configuration: MarkdownLocalImages.configuration())
+            MarkdownLocalImages.load(MarkdownRenderer.documentHTML(markdown: markdown, title: "Quality test", editable: editable), in: view, baseURL: baseURL ?? URL(fileURLWithPath: "Tests/Fixtures", isDirectory: true).standardizedFileURL)
             try wait { view.estimatedProgress == 1 && !view.isLoading }
             return view
+        }
+
+        for editable in [false, true] {
+            let view = try load("![local](./local-image.svg)", editable: editable, baseURL: imageDirectory)
+            var loaded: Bool?
+            view.callAsyncJavaScript("await Promise.all(localImageLoads); const img = document.images[0]; try { await img.decode(); return img.naturalWidth > 0 && img.src.startsWith('data:image/'); } catch { return false; }", arguments: [:], in: nil, in: .page) { result in
+                loaded = (try? result.get()) as? Bool ?? false
+            }
+            try wait { loaded != nil }
+            check(loaded == true, "Local image loads in preview and rendered editor")
         }
 
         let corpus = #"""
